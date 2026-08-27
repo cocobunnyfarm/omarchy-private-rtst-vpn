@@ -154,8 +154,9 @@ import 후에는 openvpn3 가 프로파일을 자체 저장소에 `--persistent`
 요약:
 
 1. `omarchy pkg aur add openvpn3`
-2. 회사 `.ovpn` 을 `private/` 에 둔다
-3. `openvpn3 config-import --config private/<파일>.ovpn --persistent --name hell`
+2. 회사 `.ovpn` 을 아무 곳에나 받아둔다 (다운로드 폴더 등)
+3. `vpn-ctl import <받은 파일 경로>`
+   — 파일을 `~/.config/rtst-vpn/` 로 보관하고 `--persistent --name hell` 로 import 한다
 4. `./install-core.sh --apply` (CLI 용) 또는 `omarchy plugin add ...` (위젯 용)
 
 위젯으로 쓰면 1~3 을 위젯이 안내한다 — 감지해서 필요한 것만 보여주고,
