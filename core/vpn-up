@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# vpn-up: openvpn3 세션 시작 + SSO URL 출력 + Firefox로 열기
+#
+# usage:
+#   vpn-up                  # 기본: config 'hell', Firefox 자동 오픈
+#   vpn-up myconf           # 다른 config 이름 지정
+#   vpn-up -u               # URL만 출력, 어떤 브라우저도 안 띄움
+#   vpn-up myconf -u        # 둘 조합
+#   vpn-up -h               # 도움말
+
+set -uo pipefail
+
+CONFIG="hell"
+URL_ONLY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u|--url-only) URL_ONLY=1 ;;
+    -h|--help)
+      sed -n '/^# vpn-up:/,/^[^#]/{/^[^#]/!p;}' "$0" | sed 's/^# \?//'
+      exit 0
+      ;;
+    -*) echo "[vpn-up] 알 수 없는 옵션: $1" >&2 ; exit 2 ;;
+    *)  CONFIG="$1" ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------
+# xdg-open 가로채기:
+#   openvpn3 session-start가 내부적으로 시스템 기본 브라우저를 열려고
+#   xdg-open을 호출함. 그게 Chrome으로 잡혀 있어서 Chrome이 떴음.
+#   PATH 앞에 가짜 xdg-open을 끼워 넣어서 우리가 원하는 동작으로 강제.
+# ---------------------------------------------------------------
+WRAP=$(mktemp -d)
+trap 'rm -rf "$WRAP"' EXIT
+
+if [ "$URL_ONLY" -eq 1 ]; then
+  # URL-only 모드: 어떤 브라우저도 안 띄움
+  cat > "$WRAP/xdg-open" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  export BROWSER=/bin/true
+elif [ -x /snap/bin/firefox ]; then
+  # 일반 모드: xdg-open이 호출되면 snap Firefox로 라우팅
+  cat > "$WRAP/xdg-open" <<'EOF'
+#!/bin/sh
+exec /snap/bin/firefox "$@"
+EOF
+  export BROWSER=/snap/bin/firefox
+elif command -v firefox >/dev/null 2>&1 \
+     && [[ "$(readlink -f "$(command -v firefox)")" != /snap/firefox/*/usr/lib/firefox/firefox ]]; then
+  # 비-snap firefox가 정상적으로 PATH에 있는 경우
+  FF=$(command -v firefox)
+  cat > "$WRAP/xdg-open" <<EOF
+#!/bin/sh
+exec "$FF" "\$@"
+EOF
+  export BROWSER="$FF"
+else
+  # 폴백: 시스템 xdg-open 그대로
+  cat > "$WRAP/xdg-open" <<'EOF'
+#!/bin/sh
+exec /usr/bin/xdg-open "$@"
+EOF
+fi
+chmod +x "$WRAP/xdg-open"
+export PATH="$WRAP:$PATH"
+
+# ---------------------------------------------------------------
+# 1) 이미 연결된 세션이 있으면 그냥 알리고 끝
+# ---------------------------------------------------------------
+if openvpn3 sessions-list 2>/dev/null | awk -v cfg="$CONFIG" '
+  /^ *Path:/ { path=$2 }
+  /^ *Config name:/ { name=$3 }
+  /^ *Status:.*Client connected/ && name==cfg { found=1 }
+  END { exit !found }
+'; then
+  echo "[vpn-up] 이미 연결된 세션 있음 ($CONFIG). 'openvpn3 sessions-list'로 확인."
+  exit 0
+fi
+
+# ---------------------------------------------------------------
+# 2) 같은 config의 죽은(failed/awaiting) 세션 정리
+# ---------------------------------------------------------------
+echo "[vpn-up] 좀비 세션 정리 중..."
+openvpn3 sessions-list 2>/dev/null | awk -v cfg="$CONFIG" '
+  /^ *Path:/ { path=$2 }
+  /^ *Config name:/ { name=$3 }
+  /^ *Status:/ {
+    if (name==cfg && $0 !~ /Client connected/) print path
+    path=""; name=""
+  }
+' | while read -r p; do
+  [ -n "$p" ] && openvpn3 session-manage --session-path "$p" --disconnect >/dev/null 2>&1 || true
+done
+
+# ---------------------------------------------------------------
+# 3) 새 세션 시작 (openvpn3가 내부 xdg-open 호출 → 위 wrapper로 라우팅)
+# ---------------------------------------------------------------
+echo "[vpn-up] 새 세션 시작..."
+openvpn3 session-start --config "$CONFIG"
+
+# ---------------------------------------------------------------
+# 4) Auth URL 폴링 (최대 ~10초)
+# ---------------------------------------------------------------
+URL=""
+for i in $(seq 1 20); do
+  URL=$(openvpn3 session-auth 2>/dev/null \
+        | awk -F': ' '/^ *Auth URL:/ {sub(/^ +/, "", $2); print $2; exit}')
+  [ -n "$URL" ] && break
+  sleep 0.5
+done
+
+if [ -z "$URL" ]; then
+  echo "[vpn-up] Auth URL을 못 찾음. 'openvpn3 session-auth'로 직접 확인하세요." >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------
+# 5) URL 출력
+# ---------------------------------------------------------------
+echo
+echo "================ SSO Auth URL ================"
+echo "$URL"
+echo "=============================================="
+echo
+
+if [ "$URL_ONLY" -eq 1 ]; then
+  echo "[vpn-up] URL-only 모드: 브라우저 안 열었습니다."
+  echo "         위 URL을 원하는 브라우저에 붙여넣고 Google 로그인하세요."
+else
+  if [ -x /snap/bin/firefox ]; then
+    echo "[vpn-up] Firefox로 열렸습니다. 로그인 완료하면 자동 연결됩니다."
+  else
+    echo "[vpn-up] 시스템 기본 브라우저로 열렸습니다."
+  fi
+fi
+
+echo
+echo "[vpn-up] 인증 후 검증:"
+echo "         openvpn3 sessions-list   # Status: Client connected 확인"
+echo "         ping git.rtst.co.kr"

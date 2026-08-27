@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.cocobunnyfarm.rtst-vpn",
+  "name": "RTST VPN",
+  "version": "0.1.0",
+  "author": "Ted Lee",
+  "license": "MIT",
+  "description": "openvpn3 + Google SSO VPN 상태 표시와 연결/끊기 토글.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "RTST VPN",
+    "description": "VPN 연결 상태를 표시하고 클릭으로 연결/끊기. 의존성 미충족 시 안내.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15,
+      "ctlCommand": "vpn-ctl",
+      "configName": "hell"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 15
+      }
+    ]
+  }
+}

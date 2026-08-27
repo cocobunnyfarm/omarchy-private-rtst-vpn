@@ -1,0 +1,14 @@
+# 사내 자산 — 절대 커밋하지 않는다
+private/*
+!private/README.md
+
+# openvpn 설정·인증서
+*.ovpn
+*.conf
+*.crt
+*.key
+*.pem
+
+# 편집기·OS
+*.swp
+.DS_Store

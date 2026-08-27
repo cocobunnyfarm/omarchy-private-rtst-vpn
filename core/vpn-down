@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# vpn-down: 해당 config의 모든 세션(connected/failed/awaiting 무관) 정리
+# usage: vpn-down [config_name]   (기본값: hell)
+
+set -uo pipefail
+CONFIG="${1:-hell}"
+
+paths=$(openvpn3 sessions-list 2>/dev/null | awk -v cfg="$CONFIG" '
+  /^ *Path:/ { path=$2 }
+  /^ *Config name:/ { if ($3==cfg) print path }
+')
+
+if [ -z "$paths" ]; then
+  echo "[vpn-down] $CONFIG 세션 없음."
+  exit 0
+fi
+
+while read -r p; do
+  [ -z "$p" ] && continue
+  echo "[vpn-down] disconnect: $p"
+  openvpn3 session-manage --session-path "$p" --disconnect >/dev/null 2>&1 || true
+done <<< "$paths"
+
+echo "[vpn-down] 완료."
