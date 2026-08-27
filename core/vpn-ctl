@@ -8,6 +8,9 @@
 #   vpn-ctl up [config]          연결 (SSO URL 브라우저 오픈)
 #   vpn-ctl down [config]        끊기 + 좀비 세션 정리
 #   vpn-ctl import <file>        .ovpn 을 데이터 디렉터리에 보관하고 openvpn3 에 import
+#                                프로파일 이름은 파일명에서 유도된다
+#   vpn-ctl auth-url             현재 세션의 SSO 인증 URL 출력 (복사해서 원하는
+#                                브라우저에서 열면 그 세션이 연결된다)
 #   vpn-ctl backend-install-cmd  백엔드 설치 명령 문자열을 출력 (실행하지 않음)
 #   vpn-ctl -h
 #
@@ -19,13 +22,12 @@
 #   connected        연결됨
 #   error            그 외
 #
-# ⚠️ 검증 상태: openvpn3 실기기 미설치. sessions-list 파싱은 기존
-#    vpn-up/vpn-down 의 awk 에 인코딩된 출력 형식을 근거로 작성했다.
-#    실기기 확인 후 대조 필요.
+# 검증 상태: missing-backend / missing-config 는 실기기 검증됨.
+#   sessions-list 파싱(연결 상태 판별)은 기존 vpn-up/vpn-down 의 awk 에
+#   인코딩된 출력 형식을 근거로 작성했으며 아직 실제 세션으로 대조하지 못했다.
 
 set -uo pipefail
 
-CONFIG_DEFAULT="hell"
 DATA_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rtst-vpn"
 
 # ── 유틸 ────────────────────────────────────────────────────────────────
@@ -56,10 +58,34 @@ backend_install_cmd() {
   fi
 }
 
+# import 된 프로파일 이름을 전부 나열한다.
+# configs-list 출력 형식 (v27.1 실측):
+#   Configuration Name                     Last used
+#   ------------------------------------------------
+#   hell                                   2026-08-27 15:25:31
+#   ------------------------------------------------
+configs_list_names() {
+  openvpn3 configs-list 2>/dev/null | awk '
+    /^-+$/                    { next }
+    /^Configuration Name/     { next }
+    /^No configuration/       { next }
+    NF == 0                   { next }
+    { print $1 }
+  '
+}
+
+# 프로파일 이름을 결정한다. 인자로 주면 그것, 없으면 import 된 첫 번째.
+# 매직 상수를 두지 않기 위해 openvpn3 에 등록된 것에서 발견한다.
+resolve_config() {
+  local want="${1:-}"
+  if [ -n "$want" ]; then printf '%s\n' "$want"; return 0; fi
+  configs_list_names | head -1
+}
+
 config_imported() {
-  # openvpn3 configs-list 에 해당 이름이 있는지
   local cfg="$1"
-  openvpn3 configs-list 2>/dev/null | grep -qE "(^|[[:space:]])${cfg}([[:space:]]|$)"
+  [ -n "$cfg" ] || return 1
+  configs_list_names | grep -qxF "$cfg"
 }
 
 # sessions-list 에서 해당 config 의 Status 줄을 뽑는다.
@@ -78,19 +104,41 @@ session_status_text() {
   '
 }
 
+# ── auth-url ────────────────────────────────────────────────────────────
+# 현재 세션의 SSO 인증 URL 을 출력한다.
+#
+# openvpn3 는 이 URL 을 XDG Desktop Portal 로 넘겨 **시스템 기본 브라우저**에
+# 띄운다. 그걸 바꿀 방법이 없다 ($BROWSER 무시, xdg-open 미호출, 끄는 옵션 없음).
+# 다른 브라우저에서 인증하려면 이 URL 을 복사해 직접 열면 된다 —
+# URL 은 세션에 묶여 있으므로 어디서 로그인하든 그 세션이 연결된다.
+cmd_auth_url() {
+  have_backend || { echo "vpn-ctl auth-url: openvpn3 가 없습니다" >&2; return 1; }
+  local url
+  url=$(openvpn3 session-auth 2>/dev/null \
+        | awk -F': ' '/^ *Auth URL:/ {sub(/^ +/, "", $2); print $2; exit}')
+  [ -n "$url" ] || { echo "vpn-ctl auth-url: 인증 대기 중인 세션이 없습니다" >&2; return 1; }
+  printf '%s\n' "$url"
+}
+
 # ── status ──────────────────────────────────────────────────────────────
 cmd_status() {
-  local cfg="$1" as_json="$2"
-  local state detail actionable=""
+  local want="$1" as_json="$2"
+  local state detail actionable="" cfg=""
 
   if ! have_backend; then
     state="missing-backend"
     detail="openvpn3 가 설치되지 않았습니다"
     actionable="$(backend_install_cmd)"
-  elif ! config_imported "$cfg"; then
+    emit_or_print "$state" "$detail" "$cfg" "$actionable" "$as_json"
+    return 0
+  fi
+
+  cfg="$(resolve_config "$want")"
+
+  if ! config_imported "$cfg"; then
     state="missing-config"
-    detail="프로파일 '$cfg' 이(가) import 되지 않았습니다"
-    actionable="vpn-ctl import <.ovpn 파일 경로>"
+    detail="VPN 프로파일이 등록되지 않았습니다"
+    actionable=""
   else
     local st
     st="$(session_status_text "$cfg")"
@@ -109,14 +157,20 @@ cmd_status() {
     fi
   fi
 
+  emit_or_print "$state" "$detail" "$cfg" "$actionable" "$as_json"
+  return 0
+}
+
+emit_or_print() {
+  local state="$1" detail="$2" cfg="$3" actionable="$4" as_json="$5"
   if [ "$as_json" -eq 1 ]; then
     emit_json "$state" "$detail" "$cfg" "$actionable"
   else
     printf '%s\n' "$state"
     [ -n "$detail" ]     && printf '  %s\n' "$detail"
+    [ -n "$cfg" ]        && printf '  프로파일: %s\n' "$cfg"
     [ -n "$actionable" ] && printf '  다음: %s\n' "$actionable"
   fi
-  return 0
 }
 
 # ── up / down ───────────────────────────────────────────────────────────
@@ -137,7 +191,7 @@ delegate() {
 
 # ── import ──────────────────────────────────────────────────────────────
 cmd_import() {
-  local src="$1" cfg="$2"
+  local src="$1" cfg="${2:-}"
 
   [ -n "$src" ] || { echo "vpn-ctl import: 파일 경로가 필요합니다" >&2; exit 2; }
   [ -f "$src" ] || { echo "vpn-ctl import: 파일이 없습니다: $src" >&2; exit 2; }
@@ -152,6 +206,13 @@ cmd_import() {
     echo "보관: $dest"
   fi
 
+  # 프로파일 이름은 파일명에서 유도한다 — 매직 상수를 두지 않는다.
+  # rtst-vpn.ovpn -> "rtst-vpn"
+  if [ -z "$cfg" ]; then
+    cfg="$(basename "$src")"
+    cfg="${cfg%.*}"
+  fi
+
   # --persistent: 재부팅 후에도 프로파일 유지
   openvpn3 config-import --config "$dest" --persistent --name "$cfg" || exit 1
   echo "import 완료: $cfg"
@@ -163,7 +224,7 @@ usage() { sed -n '/^# vpn-ctl —/,/^$/p' "$0" | sed 's/^# \?//'; }
 
 CMD="${1:-status}"; shift || true
 JSON=0
-CONFIG="$CONFIG_DEFAULT"
+CONFIG=""
 POSITIONAL=()
 
 while [ $# -gt 0 ]; do
@@ -183,11 +244,18 @@ case "$CMD" in
     ;;
   up)
     [ ${#POSITIONAL[@]} -gt 0 ] && CONFIG="${POSITIONAL[0]}"
+    CONFIG="$(resolve_config "$CONFIG")"
+    [ -n "$CONFIG" ] || { echo "vpn-ctl up: import 된 프로파일이 없습니다" >&2; exit 1; }
     delegate vpn-up "$CONFIG"
     ;;
   down)
     [ ${#POSITIONAL[@]} -gt 0 ] && CONFIG="${POSITIONAL[0]}"
+    CONFIG="$(resolve_config "$CONFIG")"
+    [ -n "$CONFIG" ] || { echo "vpn-ctl down: import 된 프로파일이 없습니다" >&2; exit 1; }
     delegate vpn-down "$CONFIG"
+    ;;
+  auth-url)
+    cmd_auth_url
     ;;
   import)
     [ ${#POSITIONAL[@]} -ge 1 ] || { echo "usage: vpn-ctl import <file> [config]" >&2; exit 2; }

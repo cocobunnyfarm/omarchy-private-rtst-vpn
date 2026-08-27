@@ -6,16 +6,22 @@
 #   vpn-up myconf           # 다른 config 이름 지정
 #   vpn-up -u               # URL만 출력, 어떤 브라우저도 안 띄움
 #   vpn-up myconf -u        # 둘 조합
+#   vpn-up -b               # 자동으로 기본 브라우저도 띄움 (기본: 안 띄움)
 #   vpn-up -h               # 도움말
+#
+# env:
+#   VPN_BROWSER   SSO 인증에 쓸 브라우저 명령 (vpn-ctl 이 넘겨준다)
 
 set -uo pipefail
 
-CONFIG="hell"
+CONFIG=""
 URL_ONLY=0
+OPEN_BROWSER=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -u|--url-only) URL_ONLY=1 ;;
+    -b|--open-browser) OPEN_BROWSER=1 ;;
     -h|--help)
       sed -n '/^# vpn-up:/,/^[^#]/{/^[^#]/!p;}' "$0" | sed 's/^# \?//'
       exit 0
@@ -26,47 +32,79 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# ---------------------------------------------------------------
-# xdg-open 가로채기:
-#   openvpn3 session-start가 내부적으로 시스템 기본 브라우저를 열려고
-#   xdg-open을 호출함. 그게 Chrome으로 잡혀 있어서 Chrome이 떴음.
-#   PATH 앞에 가짜 xdg-open을 끼워 넣어서 우리가 원하는 동작으로 강제.
-# ---------------------------------------------------------------
-WRAP=$(mktemp -d)
-trap 'rm -rf "$WRAP"' EXIT
 
-if [ "$URL_ONLY" -eq 1 ]; then
-  # URL-only 모드: 어떤 브라우저도 안 띄움
-  cat > "$WRAP/xdg-open" <<'EOF'
-#!/bin/sh
-exit 0
-EOF
-  export BROWSER=/bin/true
-elif [ -x /snap/bin/firefox ]; then
-  # 일반 모드: xdg-open이 호출되면 snap Firefox로 라우팅
-  cat > "$WRAP/xdg-open" <<'EOF'
-#!/bin/sh
-exec /snap/bin/firefox "$@"
-EOF
-  export BROWSER=/snap/bin/firefox
-elif command -v firefox >/dev/null 2>&1 \
-     && [[ "$(readlink -f "$(command -v firefox)")" != /snap/firefox/*/usr/lib/firefox/firefox ]]; then
-  # 비-snap firefox가 정상적으로 PATH에 있는 경우
-  FF=$(command -v firefox)
-  cat > "$WRAP/xdg-open" <<EOF
-#!/bin/sh
-exec "$FF" "\$@"
-EOF
-  export BROWSER="$FF"
-else
-  # 폴백: 시스템 xdg-open 그대로
-  cat > "$WRAP/xdg-open" <<'EOF'
-#!/bin/sh
-exec /usr/bin/xdg-open "$@"
-EOF
+# 프로파일 이름이 안 주어지면 openvpn3 에 등록된 첫 번째를 쓴다.
+# 매직 상수를 두지 않기 위한 것 — vpn-ctl 도 같은 규칙을 쓴다.
+discover_config() {
+  openvpn3 configs-list 2>/dev/null | awk '
+    /^-+$/                { next }
+    /^Configuration Name/ { next }
+    /^No configuration/   { next }
+    NF == 0               { next }
+    { print $1; exit }
+  '
+}
+
+if [ -z "$CONFIG" ]; then
+  CONFIG=$(discover_config)
+  [ -n "$CONFIG" ] || { echo "[vpn-up] import 된 프로파일이 없습니다." >&2; exit 1; }
 fi
-chmod +x "$WRAP/xdg-open"
-export PATH="$WRAP:$PATH"
+
+# ---------------------------------------------------------------
+# 자동 브라우저 열기 억제 (실측 기반, openvpn3 v27.1)
+#
+#   openvpn3 는 SSO 인증 URL 을 GLib 의 기본앱 실행
+#   (g_app_info_launch_default_for_uri 계열)로 띄운다. 즉 mimeapps.list 의
+#   x-scheme-handler/https 핸들러를 직접 exec 한다.
+#
+#   확인한 것들:
+#     - $BROWSER                    → 무시된다 (센티넬 미호출)
+#     - PATH 의 가짜 xdg-open       → 호출되지 않는다
+#     - XDG Desktop Portal OpenURI  → D-Bus 감시 결과 호출 0건
+#     - session-start 옵션          → 자동 열기를 끄는 플래그 없음
+#
+#   GLib 은 XDG_CONFIG_HOME / XDG_DATA_HOME 을 따르므로, session-start 호출에만
+#   no-op 핸들러를 물린 임시 환경을 씌우면 브라우저가 열리지 않는다.
+#   전역 설정(mimeapps.list, 기본 브라우저)은 건드리지 않는다.
+#
+#   URL 은 아래에서 폴링해 출력하므로, 원하는 브라우저에 붙여넣어 인증하면 된다.
+#   자동 열기를 원하면 -b / --open-browser 를 준다.
+# ---------------------------------------------------------------
+setup_noopen_env() {
+  NOOPEN=$(mktemp -d)
+  mkdir -p "$NOOPEN/config" "$NOOPEN/data/applications"
+  cat > "$NOOPEN/config/mimeapps.list" <<'MIMEEOF'
+[Default Applications]
+x-scheme-handler/https=vpn-noop.desktop
+x-scheme-handler/http=vpn-noop.desktop
+MIMEEOF
+  cat > "$NOOPEN/data/applications/vpn-noop.desktop" <<'DESKEOF'
+[Desktop Entry]
+Type=Application
+Name=VPN noop
+Exec=/bin/true %u
+NoDisplay=true
+Terminal=false
+MimeType=x-scheme-handler/https;x-scheme-handler/http;
+DESKEOF
+  update-desktop-database "$NOOPEN/data/applications" 2>/dev/null || true
+}
+
+NOOPEN=""
+if [ "$OPEN_BROWSER" -eq 0 ]; then
+  setup_noopen_env
+  trap 'rm -rf "$NOOPEN"' EXIT
+fi
+
+# session-start 를 감싼다. 다른 openvpn3 호출은 브라우저를 열지 않으므로 그대로.
+openvpn3_session_start() {
+  if [ -n "$NOOPEN" ]; then
+    XDG_CONFIG_HOME="$NOOPEN/config" XDG_DATA_HOME="$NOOPEN/data" \
+      openvpn3 session-start "$@"
+  else
+    openvpn3 session-start "$@"
+  fi
+}
 
 # ---------------------------------------------------------------
 # 1) 이미 연결된 세션이 있으면 그냥 알리고 끝
@@ -97,10 +135,10 @@ openvpn3 sessions-list 2>/dev/null | awk -v cfg="$CONFIG" '
 done
 
 # ---------------------------------------------------------------
-# 3) 새 세션 시작 (openvpn3가 내부 xdg-open 호출 → 위 wrapper로 라우팅)
+# 3) 새 세션 시작 (URL 은 아래 4) 에서 폴링해 우리가 직접 띄운다)
 # ---------------------------------------------------------------
 echo "[vpn-up] 새 세션 시작..."
-openvpn3 session-start --config "$CONFIG"
+openvpn3_session_start --config "$CONFIG"
 
 # ---------------------------------------------------------------
 # 4) Auth URL 폴링 (최대 ~10초)
@@ -130,12 +168,11 @@ echo
 if [ "$URL_ONLY" -eq 1 ]; then
   echo "[vpn-up] URL-only 모드: 브라우저 안 열었습니다."
   echo "         위 URL을 원하는 브라우저에 붙여넣고 Google 로그인하세요."
+elif [ "$OPEN_BROWSER" -eq 1 ]; then
+  echo "[vpn-up] 시스템 기본 브라우저로 열렸습니다. 로그인 완료하면 자동 연결됩니다."
 else
-  if [ -x /snap/bin/firefox ]; then
-    echo "[vpn-up] Firefox로 열렸습니다. 로그인 완료하면 자동 연결됩니다."
-  else
-    echo "[vpn-up] 시스템 기본 브라우저로 열렸습니다."
-  fi
+  echo "[vpn-up] 브라우저를 열지 않았습니다. 위 URL 을 원하는 브라우저에서 여세요."
+  echo "         (vpn-ctl auth-url 로도 다시 얻을 수 있습니다)"
 fi
 
 echo

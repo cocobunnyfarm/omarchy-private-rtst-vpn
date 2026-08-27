@@ -57,29 +57,37 @@ UI 가 이 계약만 알면 되므로, **위젯은 openvpn3 도 RTST 도 모른�
 
 ```
 vpn-ctl status --json      # 상태 조회. 항상 종료코드 0, 상태는 JSON 으로
-vpn-ctl up [config]        # 연결 시작 (SSO URL 브라우저 오픈)
+vpn-ctl up [config]        # 연결 시작 (브라우저는 열지 않고 URL 만 출력)
 vpn-ctl down [config]      # 끊기 + 좀비 세션 정리
+vpn-ctl auth-url           # 현재 세션의 SSO 인증 URL (원하는 브라우저에서 열면 연결)
+vpn-ctl import <file>      # .ovpn 보관 + import. 프로파일 이름은 파일명에서 유도
+```
+
+config 인자를 생략하면 `openvpn3 configs-list` 에서 첫 프로파일을 발견한다 —
+매직 상수(`hell` 같은 것)를 두지 않는다.
+
+```
 ```
 
 ### `status --json` 응답
 
 ```json
 {
-  "state": "ready",
-  "detail": "connected to hell",
-  "config": "hell",
+  "state": "disconnected",
+  "detail": "세션 없음",
+  "config": "hansulee-hell",
   "actionable": null
 }
 ```
 
 | `state` | 뜻 | 위젯 표현 |
 |---|---|---|
-| `missing-backend` | `openvpn3` 미설치 | 회색. 클릭 시 설치 안내 |
-| `missing-config` | 설치됐으나 프로파일 미 import | 회색. 클릭 시 import 안내 |
-| `disconnected` | 준비됐고 미연결 | 평상시 색. 클릭 시 연결 |
-| `authenticating` | SSO 인증 대기 | 점멸/강조 |
-| `connected` | 연결됨 | 활성 색 |
-| `error` | 그 외 | 경고색 + `detail` |
+| `missing-backend` | `openvpn3` 미설치 | 금간 쉴드. 클릭 시 설치 안내 |
+| `missing-config` | 설치됐으나 프로파일 미 import | 금간 쉴드. `.ovpn` 선택 버튼 |
+| `disconnected` | 준비됐고 미연결 | 쉴드 (흐림). 클릭 시 연결 |
+| `authenticating` | SSO 인증 대기 | 쉴드 (흐림). 인증 URL 복사 버튼 |
+| `connected` | 연결됨 | 쉴드 (밝게) |
+| `error` | 그 외 | 금간 쉴드 + `detail` |
 
 `actionable` 은 사용자가 실행해야 하는 명령 문자열(또는 `null`).
 **위젯은 이걸 자동 실행하지 않는다** — 아래 참조.
@@ -156,7 +164,7 @@ import 후에는 openvpn3 가 프로파일을 자체 저장소에 `--persistent`
 1. `omarchy pkg aur add openvpn3`
 2. 회사 `.ovpn` 을 아무 곳에나 받아둔다 (다운로드 폴더 등)
 3. `vpn-ctl import <받은 파일 경로>`
-   — 파일을 `~/.config/rtst-vpn/` 로 보관하고 `--persistent --name hell` 로 import 한다
+   — 파일을 `~/.config/rtst-vpn/` 로 보관하고 파일명에서 유도한 이름으로 import 한다
 4. `./install-core.sh --apply` (CLI 용) 또는 `omarchy plugin add ...` (위젯 용)
 
 위젯으로 쓰면 1~3 을 위젯이 안내한다 — 감지해서 필요한 것만 보여주고,
@@ -168,16 +176,32 @@ import 후에는 openvpn3 가 프로파일을 자체 저장소에 `--persistent`
 
 | 항목 | 상태 |
 |---|---|
-| `manifest.json` | 작성됨, `omarchy plugin validate` 통과 |
-| `core/vpn-up`, `core/vpn-down` | 원본에서 가져옴. **Arch 수정 미적용** |
-| `core/vpn-ctl` | 작성됨. `missing-backend` 경로는 실기기 검증됨. 나머지 상태는 미검증 |
-| `Widget.qml` | **골격만.** 검증 전 |
-| Arch 실기기 검증 | **미수행** — `openvpn3` 미설치 |
+| `manifest.json` | `omarchy plugin validate` 통과 |
+| `core/vpn-ctl` | 전 상태 실기기 검증 (`missing-backend` → `missing-config` → `authenticating` → `connected`) |
+| `core/vpn-up` | Arch 이식 완료. 가로채기 제거 + 자동 열기 억제. 프로파일 자동 발견 |
+| `core/vpn-down` | 프로파일 자동 발견 |
+| `Widget.qml` | 3단계 UI + URL 복사 버튼. 실기기 동작 확인 |
+| 연결 전 구간 | **검증됨** — 설치 → import → 인증 → 연결 → 끊기 |
+
+### 미결
+
+- `dimmed` 기반 아이콘 밝기 구분은 배포됐으나 셸 리로드 전이라 **육안 검증 안 됨**
+- 브라우저 **선택**(억제가 아니라 특정 브라우저로 열기)은 미구현.
+  같은 기법으로 가능하다 — 임시 `mimeapps.list` 에
+  `x-scheme-handler/https=firefox.desktop` 한 줄. `XDG_DATA_DIRS` 를 건드리지 않으면
+  `/usr/share/applications` 에서 해석된다
 
 ### 알려진 Arch 이식 이슈
 
 1. `openvpn3` 는 AUR (`aur/openvpn3`). 원본의 `apt install` 은 해당 없음
-2. **snap 이 없다** → `vpn-up` 의 `/snap/bin/firefox` 분기는 절대 안 탄다.
-   `/usr/bin/firefox` 네이티브라 두 번째 분기로 가서 수정 없이 동작한다.
-   원본 README 의 "snap firefox 심볼릭 링크 함정" 항목도 해당 없음
+2. **원본의 브라우저 강제 방식(`xdg-open` PATH 가로채기)은 통하지 않는다.**
+   openvpn3 v27.1 은 GLib 의 기본앱 실행(`g_app_info_launch_default_for_uri` 계열)로
+   `mimeapps.list` 핸들러를 직접 exec 한다. 실측으로 확인한 것:
+   - `$BROWSER` → 무시 (센티넬 미호출)
+   - PATH 의 가짜 `xdg-open` → 미호출
+   - XDG Portal `OpenURI` → `dbus-monitor` 결과 **호출 0건**
+   - `session-start` 에 자동 열기를 끄는 옵션 없음
+
+   snap 분기도 당연히 무의미하다 (Arch 에 snap 없음). 가로채기 코드 전체를 제거하고,
+   대신 `session-start` 호출에만 no-op 핸들러 환경을 씌워 자동 열기를 억제한다
 3. `vpn-status` alias 는 `~/.bashrc` 에 한 줄만 추가하는 delta 로 관리

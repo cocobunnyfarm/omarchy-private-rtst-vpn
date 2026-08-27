@@ -4,71 +4,97 @@ import qs.Commons
 import qs.Ui
 
 // ─────────────────────────────────────────────────────────────────────────
-// RTST VPN 바 위젯 — 골격 (아직 실기기 검증 전)
+// RTST VPN 바 위젯
 //
-// 이 위젯은 openvpn3 도 RTST 도 모른다. `ctlCommand` 가 가리키는 CLI 를
-// `Process` 로 호출해 JSON 을 받아 그리기만 한다. 계약은 README 참조.
+// 이 위젯은 openvpn3 도 RTST 도 모른다. core/vpn-ctl 을 Process 로 호출해
+// JSON 을 받아 그리기만 한다. 계약은 README 참조.
 //
-// 검증 상태: openvpn3 미설치로 실동작 미확인. core/vpn-ctl 검증 후
-//            팝업 UI 를 채운다.
+// 화면은 준비 상태에 따라 단계적으로 바뀐다:
+//   missing-backend → openvpn3 설치 안내만 보여준다 (그 전엔 나머지가 무의미)
+//   missing-config  → .ovpn 파일 선택 UI
+//   그 외           → 정상 연결/끊기 UI
 // ─────────────────────────────────────────────────────────────────────────
 BarWidget {
   id: root
   moduleName: "io.github.cocobunnyfarm.rtst-vpn"
 
+  // 플러그인 폴더 기준 절대경로. PATH 에 의존하면 안 된다 —
+  // core/ 는 플러그인과 함께 배포되므로 self-contained 로 해석한다.
+  readonly property string backendCommand:
+    String(Qt.resolvedUrl("core/vpn-ctl")).replace(/^file:\/\//, "")
+
   readonly property int refreshSec: setting("refreshIntervalSec", 15)
-  readonly property string ctlCommand: setting("ctlCommand", "vpn-ctl")
   readonly property string configName: setting("configName", "hell")
 
-  // vpn-ctl status --json 의 파싱 결과
-  property string state: "unknown"
+  // vpn-ctl status --json 파싱 결과
+  property string vpnState: "loading"
   property string detail: ""
   property string actionable: ""
+  property string lastError: ""
+  property string authUrl: ""
+  property bool urlCopied: false
 
-  readonly property bool ready: state === "connected" || state === "disconnected"
-                                || state === "authenticating"
+  readonly property bool busy: statusProc.running || actionProc.running
+                               || pickProc.running || importProc.running
 
-  // 상태별 글리프
-  readonly property string glyph: {
-    switch (state) {
-      case "connected":       return "󰦝"   // shield-check
-      case "authenticating":  return "󰦛"   // shield-half
-      case "disconnected":    return "󰦞"   // shield-off
-      case "missing-backend":
-      case "missing-config":  return "󰦝"
-      default:                return "󰦞"
+  // 아이콘은 두 종류만 쓴다 — 바에 위젯이 여러 개라 종류가 많으면 헷갈린다.
+  //   󰦝 온전한 쉴드  : 쓸 준비가 된 상태 (연결됨 / 미연결 / 인증 중)
+  //   󰦞 금간 쉴드    : 쓸 수 없는 상태 (백엔드·프로파일 없음 / 오류)
+  readonly property bool usable: vpnState === "connected"
+                                 || vpnState === "disconnected"
+                                 || vpnState === "authenticating"
+
+  readonly property string glyph: usable ? "󰦝" : "󰦞"
+
+  // 밝기로 구분한다. 색을 직접 지정하지 않고 WidgetButton 의 dimmed 를 쓴다 —
+  // 바의 기본 전경색(bar.barForeground)을 그대로 쓰면서 opacity 만 45% 로
+  // 떨어뜨리므로 테마가 바뀌어도 어긋나지 않는다.
+  //   연결됨   → 100% (밝은 흰색)
+  //   그 외    → 45%  (회색으로 보임)
+  readonly property bool connected: vpnState === "connected"
+
+  // 사람이 읽는 제목
+  readonly property string headline: {
+    switch (vpnState) {
+      case "loading":         return "확인 중…"
+      case "missing-backend": return "openvpn3 설치 필요"
+      case "missing-config":  return "VPN 프로파일 없음"
+      case "disconnected":    return "연결 안 됨"
+      case "authenticating":  return "브라우저에서 로그인 대기"
+      case "connected":       return "연결됨"
+      case "backend-failed":  return "vpn-ctl 실행 실패"
+      default:                return "오류"
     }
   }
 
   // ── 상태 조회 ─────────────────────────────────────────────────────────
   Process {
     id: statusProc
-    command: [root.ctlCommand, "status", "--json"]
+    command: [root.backendCommand, "status", "--json", root.configName]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
+    stderr: StdioCollector { id: statusErr; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        // 명령 자체가 없으면 백엔드 미설치로 간주
-        root.state = "missing-backend"
-        root.detail = root.ctlCommand + " 를 찾을 수 없음"
+        // vpn-ctl 자체가 실행되지 않은 경우 — 경로 문제 등
+        root.vpnState = "backend-failed"
+        root.detail = statusErr.text.trim() || (root.backendCommand + " 실행 실패")
         root.actionable = ""
         return
       }
       try {
         var d = JSON.parse(statusOut.text)
-        root.state = d.state || "unknown"
+        root.vpnState = d.state || "error"
         root.detail = d.detail || ""
         root.actionable = d.actionable || ""
       } catch (e) {
-        root.state = "error"
-        root.detail = "status JSON 파싱 실패"
+        root.vpnState = "backend-failed"
+        root.detail = "status JSON 파싱 실패: " + statusOut.text.trim().slice(0, 120)
         root.actionable = ""
       }
     }
   }
 
-  function refreshNow() {
-    if (!statusProc.running) statusProc.running = true
-  }
+  function refreshNow() { if (!statusProc.running) statusProc.running = true }
 
   Timer {
     interval: root.refreshSec * 1000
@@ -81,43 +107,129 @@ BarWidget {
   // ── 연결 / 끊기 ───────────────────────────────────────────────────────
   Process {
     id: actionProc
-    onExited: root.refreshNow()
+    stderr: StdioCollector { id: actionErr; waitForEnd: true }
+    onExited: function(code) {
+      if (code !== 0) root.lastError = actionErr.text.trim()
+      root.refreshNow()
+    }
   }
 
-  function connect() {
+  function runAction(args) {
     if (actionProc.running) return
-    actionProc.command = [root.ctlCommand, "up", root.configName]
+    root.lastError = ""
+    actionProc.command = [root.backendCommand].concat(args)
     actionProc.running = true
   }
 
-  function disconnect() {
-    if (actionProc.running) return
-    actionProc.command = [root.ctlCommand, "down", root.configName]
-    actionProc.running = true
+  function connectVpn()    { runAction(["up", root.configName]) }
+  function disconnectVpn() { runAction(["down", root.configName]) }
+
+  // ── .ovpn 파일 선택 → import ──────────────────────────────────────────
+  // Omarchy 공식 파일 선택기. 종료코드 1 = 아무것도 안 고름(정상),
+  // 2 = 선택기가 뜨지 않음(실패). 둘을 구분해 처리한다.
+  Process {
+    id: pickProc
+    command: ["omarchy-file-select", "--title", "회사 .ovpn 파일 선택",
+              "--extensions", "ovpn conf"]
+    stdout: StdioCollector { id: pickOut; waitForEnd: true }
+    onExited: function(code) {
+      if (code === 0) {
+        var path = pickOut.text.trim().split("\n")[0]
+        if (path.length > 0) root.importConfig(path)
+      } else if (code === 2) {
+        root.lastError = "파일 선택기를 열 수 없습니다"
+      }
+      // code === 1 은 사용자가 취소한 것 — 조용히 넘어간다
+    }
   }
 
-  // 의존성 미충족 시 — 자동 설치하지 않는다. 보이는 터미널을 띄운다.
-  // (AUR 은 yay 가 sudo 를 직접 물어보고 makepkg 가 root 를 거부하므로
-  //  위젯에서의 자동 설치는 기계적으로 불가능. README 참조)
+  Process {
+    id: importProc
+    stderr: StdioCollector { id: importErr; waitForEnd: true }
+    onExited: function(code) {
+      if (code !== 0) root.lastError = importErr.text.trim() || "import 실패"
+      root.refreshNow()
+    }
+  }
+
+  function pickConfig() { if (!pickProc.running) pickProc.running = true }
+
+  function importConfig(path) {
+    if (importProc.running) return
+    root.lastError = ""
+    importProc.command = [root.backendCommand, "import", path, root.configName]
+    importProc.running = true
+  }
+
+  // ── 인증 URL 복사 ─────────────────────────────────────────────────────
+  // openvpn3 는 인증 URL 을 XDG Desktop Portal 로 넘겨 시스템 기본 브라우저에
+  // 띄운다. 그걸 바꿀 방법이 없다 ($BROWSER 무시, xdg-open 미호출, 끄는 옵션
+  // 없음). 전역 기본 브라우저를 바꾸는 건 VPN 인증 하나를 위해 치를 대가가
+  // 아니므로, 대신 URL 을 복사해 원하는 브라우저에서 열게 한다.
+  // URL 은 세션에 묶여 있어 어디서 로그인해도 그 세션이 연결된다.
+  Process {
+    id: urlProc
+    command: [root.backendCommand, "auth-url"]
+    stdout: StdioCollector { id: urlOut; waitForEnd: true }
+    onExited: function(code) {
+      if (code !== 0) { root.lastError = "인증 URL 을 가져오지 못했습니다"; return }
+      root.authUrl = urlOut.text.trim()
+      if (root.authUrl.length > 0) {
+        copyProc.command = ["sh", "-c", "printf '%s' \"$1\" | wl-copy", "sh", root.authUrl]
+        copyProc.running = true
+      }
+    }
+  }
+
+  Process {
+    id: copyProc
+    onExited: function(code) {
+      root.urlCopied = (code === 0)
+      if (code !== 0) root.lastError = "클립보드 복사 실패"
+      copiedReset.restart()
+    }
+  }
+
+  Timer { id: copiedReset; interval: 2500; onTriggered: root.urlCopied = false }
+
+  function copyAuthUrl() {
+    if (urlProc.running || copyProc.running) return
+    root.lastError = ""
+    urlProc.running = true
+  }
+
+  // ── 설치 안내 (자동 설치하지 않는다 — README 참조) ────────────────────
   Process { id: termProc }
 
-  function runInTerminal(cmd) {
-    if (termProc.running || !cmd) return
-    termProc.command = ["omarchy-launch-floating-terminal-with-presentation", cmd]
+  function openInstallTerminal() {
+    if (termProc.running || root.actionable.length === 0) return
+    termProc.command = ["omarchy-launch-floating-terminal-with-presentation",
+                        root.actionable]
     termProc.running = true
+  }
+
+  Process { id: menuProc }
+
+  // Omarchy 의 AUR 설치기(fzf 검색)를 바로 띄운다. openvpn3 는 공식 저장소가
+  // 아니라 AUR 이므로 Install > Package 가 아니라 Install > AUR 로 보낸다.
+  function openAurMenu() {
+    if (menuProc.running) return
+    menuProc.command = ["omarchy", "menu", "summon", "install.aur"]
+    menuProc.running = true
   }
 
   // ── 팝업 라우팅 계약 ──────────────────────────────────────────────────
   property bool panelOpen: false
   readonly property bool opened: panelOpen
-  function open() { panelOpen = true; refreshNow() }
+  function open() { panelOpen = true; urlCopied = false; refreshNow() }
   function close() { panelOpen = false }
   function togglePanel() { panelOpen ? close() : open() }
 
   IpcHandler {
     target: "io.github.cocobunnyfarm.rtst-vpn"
-
     function refresh(): void { root.refreshNow() }
+    function open(): void { root.open() }
+    function close(): void { root.close() }
     function toggle(): void { root.togglePanel() }
   }
 
@@ -130,6 +242,7 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: root.glyph
+    dimmed: !root.connected
 
     onPressed: function(b) {
       if (b === Qt.RightButton) root.refreshNow()
@@ -137,7 +250,7 @@ BarWidget {
     }
   }
 
-  // ── 팝업 (골격 — 검증 후 확장) ────────────────────────────────────────
+  // ── 팝업 ──────────────────────────────────────────────────────────────
   readonly property real pad: Style.space(14)
 
   KeyboardPanel {
@@ -146,7 +259,7 @@ BarWidget {
     owner: root
     bar: root.bar
     open: root.panelOpen
-    contentWidth: panel.fittedContentWidth(Style.space(280))
+    contentWidth: panel.fittedContentWidth(Style.space(320))
     contentHeight: panel.fittedContentHeight(col.implicitHeight + root.pad * 2)
 
     PanelKeyCatcher {
@@ -158,31 +271,151 @@ BarWidget {
         x: root.pad
         y: root.pad
         width: parent.width - root.pad * 2
-        spacing: Style.space(8)
+        spacing: Style.space(10)
+
+        PanelSectionHeader { text: "RTST VPN" }
 
         Text {
-          text: "RTST VPN"
-          color: Qt.darker(Color.foreground, 1.4)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-        }
-
-        Text {
-          text: root.state
+          text: root.headline
           color: Color.foreground
           font.family: Style.font.family
-          font.pixelSize: Style.font.body * 1.2
+          font.pixelSize: Style.font.body * 1.15
           font.bold: true
         }
 
         Text {
-          visible: root.detail !== ""
+          visible: root.detail.length > 0 && root.vpnState !== "missing-backend"
+                   && root.vpnState !== "missing-config"
           text: root.detail
           width: parent.width
           wrapMode: Text.WordWrap
-          color: Qt.darker(Color.foreground, 1.2)
+          color: Qt.darker(Color.foreground, 1.3)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
+        }
+
+        // ── 1단계: openvpn3 미설치 ──────────────────────────────────────
+        // 이게 없으면 나머지가 전부 무의미하므로 이 화면만 보여준다.
+        Column {
+          visible: root.vpnState === "missing-backend"
+          width: parent.width
+          spacing: Style.space(10)
+
+          PanelSeparator { width: parent.width }
+
+          Text {
+            text: "openvpn3 패키지를 설치해주세요."
+            width: parent.width
+            wrapMode: Text.WordWrap
+            color: Qt.darker(Color.foreground, 1.2)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            spacing: Style.space(8)
+
+            Button {
+              text: "AUR 설치 메뉴"
+              bordered: true
+              onClicked: root.openAurMenu()
+            }
+
+            Button {
+              text: "터미널에서 실행"
+              bordered: true
+              onClicked: root.openInstallTerminal()
+            }
+          }
+        }
+
+        // ── 2단계: 프로파일 미 import ───────────────────────────────────
+        Column {
+          visible: root.vpnState === "missing-config"
+          width: parent.width
+          spacing: Style.space(8)
+
+          PanelSeparator { width: parent.width }
+
+          Text {
+            text: "회사에서 받은 .ovpn 파일을 선택하세요."
+            width: parent.width
+            wrapMode: Text.WordWrap
+            color: Qt.darker(Color.foreground, 1.2)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Button {
+            text: root.busy ? "처리 중…" : ".ovpn 파일 선택"
+            bordered: true
+            enabled: !root.busy
+            onClicked: root.pickConfig()
+          }
+        }
+
+        // ── 3단계: 정상 동작 ────────────────────────────────────────────
+        Column {
+          visible: root.usable
+          width: parent.width
+          spacing: Style.space(8)
+
+          PanelSeparator { width: parent.width }
+
+          Button {
+            visible: root.vpnState === "disconnected"
+            text: root.busy ? "연결 중…" : "연결"
+            bordered: true
+            enabled: !root.busy
+            onClicked: root.connectVpn()
+          }
+
+          Button {
+            visible: root.vpnState === "connected"
+                     || root.vpnState === "authenticating"
+            text: root.busy ? "처리 중…" : "끊기"
+            bordered: true
+            enabled: !root.busy
+            onClicked: root.disconnectVpn()
+          }
+
+          Text {
+            visible: root.vpnState === "authenticating"
+            text: "브라우저에서 Google 로그인을 완료하면 연결됩니다."
+            width: parent.width
+            wrapMode: Text.WordWrap
+            color: Qt.darker(Color.foreground, 1.3)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          // 인증은 시스템 기본 브라우저로 열린다. 다른 브라우저에서 하려면
+          // URL 을 복사해 직접 연다.
+          Button {
+            visible: root.vpnState === "authenticating"
+            text: root.urlCopied ? "복사됨" : "인증 URL 복사"
+            bordered: true
+            enabled: !urlProc.running && !copyProc.running
+            onClicked: root.copyAuthUrl()
+          }
+        }
+
+        // ── 오류 표시 ───────────────────────────────────────────────────
+        Column {
+          visible: root.lastError.length > 0
+          width: parent.width
+          spacing: Style.space(4)
+
+          PanelSeparator { width: parent.width }
+
+          Text {
+            text: root.lastError
+            width: parent.width
+            wrapMode: Text.WordWrap
+            color: root.bar && root.bar.urgent ? root.bar.urgent : Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
         }
       }
     }

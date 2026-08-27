@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 # vpn-down: 해당 config의 모든 세션(connected/failed/awaiting 무관) 정리
-# usage: vpn-down [config_name]   (기본값: hell)
+# usage: vpn-down [config_name]   (생략하면 등록된 첫 프로파일)
 
 set -uo pipefail
-CONFIG="${1:-hell}"
+CONFIG="${1:-}"
+# 프로파일 이름이 안 주어지면 openvpn3 에 등록된 첫 번째를 쓴다.
+# 매직 상수를 두지 않기 위한 것 — vpn-ctl 도 같은 규칙을 쓴다.
+discover_config() {
+  openvpn3 configs-list 2>/dev/null | awk '
+    /^-+$/                { next }
+    /^Configuration Name/ { next }
+    /^No configuration/   { next }
+    NF == 0               { next }
+    { print $1; exit }
+  '
+}
+
+if [ -z "$CONFIG" ]; then
+  CONFIG=$(discover_config)
+  [ -n "$CONFIG" ] || { echo "[vpn-down] import 된 프로파일이 없습니다." >&2; exit 0; }
+fi
 
 paths=$(openvpn3 sessions-list 2>/dev/null | awk -v cfg="$CONFIG" '
   /^ *Path:/ { path=$2 }
