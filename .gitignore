@@ -1,8 +1,6 @@
-# 사내 자산 — 절대 커밋하지 않는다
-private/*
-!private/README.md
-
-# openvpn 설정·인증서
+# 사내 자산은 애초에 이 repo 에 들어오지 않는다.
+# .ovpn 은 ~/.config/rtst-vpn/ 에 보관한다 (README 참조).
+# 아래는 실수 방지용 이중 안전장치.
 *.ovpn
 *.conf
 *.crt

@@ -110,9 +110,39 @@ omarchy-launch-floating-terminal-with-presentation 'omarchy pkg aur add openvpn3
 Omarchy 가 자기 `Install →` 메뉴에서 쓰는 방식이라 sudo 프롬프트가 정상 동작하고
 빌드 과정이 눈에 보인다.
 
-### `.ovpn` import 는 애초에 자동화 대상이 아니다
+### `.ovpn` 은 사람이 골라야 하지만, 고르는 것 자체는 위젯이 돕는다
 
-사내 자산 파일이라 사람이 받아와야 한다. → `private/README.md`
+파일을 **가져오는** 것은 자동화할 수 없다 (사내 자산). 하지만 **고르는** 것은
+Omarchy 의 공식 파일 선택기로 처리한다:
+
+```bash
+omarchy-file-select --title "회사 .ovpn 선택" --extensions "ovpn conf"
+```
+
+XDG desktop portal 기반 실제 파일 다이얼로그다. 종료 코드가
+`1`(아무것도 안 고름 — 정상적인 결정) / `2`(선택기가 안 뜸 — 실패) 로 구분되어
+위젯에서 다르게 처리할 수 있다.
+
+고른 파일은 `vpn-ctl import` 가 데이터 디렉터리로 보관하고 openvpn3 에 import 한다.
+
+## 데이터 디렉터리
+
+`.ovpn` 원본은 **repo 안이 아니라** XDG 경로에 보관한다:
+
+```
+${XDG_CONFIG_HOME:-~/.config}/rtst-vpn/       # 권한 700, 파일 600
+```
+
+repo 상대 경로를 쓰지 않는 이유:
+
+| 후보 | 문제 |
+|---|---|
+| repo 안 `private/` | 경로가 환경마다 다르다. 코어가 "Omarchy 없이 어디서든" 돌아야 하는 요구와 충돌 |
+| `~/.config/omarchy/plugins/<id>/` | `plugin remove`/재설치 때 날아간다. Omarchy 전용 경로 |
+| **`~/.config/rtst-vpn/`** | XDG 표준. 플러그인 재설치와 무관. 비-Omarchy 환경에서도 동일 |
+
+import 후에는 openvpn3 가 프로파일을 자체 저장소에 `--persistent` 로 보관하므로
+연결에 이 파일이 필요하지 않다. 재설치·재import 를 위해 남겨둔다.
 
 ---
 
@@ -126,7 +156,10 @@ Omarchy 가 자기 `Install →` 메뉴에서 쓰는 방식이라 sudo 프롬프
 1. `omarchy pkg aur add openvpn3`
 2. 회사 `.ovpn` 을 `private/` 에 둔다
 3. `openvpn3 config-import --config private/<파일>.ovpn --persistent --name hell`
-4. `./install-core.sh` (CLI 용) 또는 `omarchy plugin add ...` (위젯 용)
+4. `./install-core.sh --apply` (CLI 용) 또는 `omarchy plugin add ...` (위젯 용)
+
+위젯으로 쓰면 1~3 을 위젯이 안내한다 — 감지해서 필요한 것만 보여주고,
+설치는 보이는 터미널에서, 파일 선택은 `omarchy-file-select` 로.
 
 ---
 
@@ -136,7 +169,7 @@ Omarchy 가 자기 `Install →` 메뉴에서 쓰는 방식이라 sudo 프롬프
 |---|---|
 | `manifest.json` | 작성됨, `omarchy plugin validate` 통과 |
 | `core/vpn-up`, `core/vpn-down` | 원본에서 가져옴. **Arch 수정 미적용** |
-| `core/vpn-ctl` | **미작성** — 계약만 확정 |
+| `core/vpn-ctl` | 작성됨. `missing-backend` 경로는 실기기 검증됨. 나머지 상태는 미검증 |
 | `Widget.qml` | **골격만.** 검증 전 |
 | Arch 실기기 검증 | **미수행** — `openvpn3` 미설치 |
 
