@@ -11,12 +11,16 @@
 #                                프로파일 이름은 파일명에서 유도된다
 #   vpn-ctl auth-url             현재 세션의 SSO 인증 URL 출력 (복사해서 원하는
 #                                브라우저에서 열면 그 세션이 연결된다)
+#   vpn-ctl ensure-config        프로파일이 없으면 보관된 .ovpn 으로 복구
+#                                (status/up 이 자동으로 하므로 보통 직접 쓸 일 없다)
 #   vpn-ctl backend-install-cmd  백엔드 설치 명령 문자열을 출력 (실행하지 않음)
 #   vpn-ctl -h
 #
 # 상태 모델 (status --json 의 .state):
 #   missing-backend  openvpn3 미설치
-#   missing-config   설치됐으나 프로파일 미 import
+#   backend-busy       openvpn3 서비스 응답 없음 (부팅 직후 등). 프로파일 유무는 미확정
+#   missing-config     프로파일도 보관본도 없다 — 파일을 골라야 한다.
+#                      보관본이 있으면 status 가 조용히 복원하므로 이 상태가 안 된다.
 #   disconnected     준비됐고 미연결
 #   authenticating   SSO 인증 대기
 #   connected        연결됨
@@ -64,14 +68,56 @@ backend_install_cmd() {
 #   ------------------------------------------------
 #   hell                                   2026-08-27 15:25:31
 #   ------------------------------------------------
+# openvpn3 configs-list 원문을 캐시한다 (한 번만 호출).
+CONFIGS_RAW=""
+CONFIGS_OK=0
+configs_load() {
+  [ -n "$CONFIGS_RAW" ] && return 0
+  CONFIGS_RAW="$(openvpn3 configs-list 2>/dev/null)"
+  # 표 헤더가 있으면 openvpn3 가 실제로 응답한 것이다. 없으면 조회 실패로 본다 —
+  # configmgr 은 D-Bus on-demand 서비스라 부팅 직후엔 활성화 전일 수 있다.
+  # "빈 목록" 과 "물어볼 수 없었음" 을 절대 같게 취급하지 않는다.
+  if printf '%s' "$CONFIGS_RAW" | grep -q 'Configuration Name'; then
+    CONFIGS_OK=1
+  else
+    CONFIGS_OK=0
+  fi
+}
+
+backend_ready() { configs_load; [ "$CONFIGS_OK" -eq 1 ]; }
+
 configs_list_names() {
-  openvpn3 configs-list 2>/dev/null | awk '
+  configs_load
+  [ "$CONFIGS_OK" -eq 1 ] || return 0
+  printf '%s\n' "$CONFIGS_RAW" | awk '
     /^-+$/                    { next }
     /^Configuration Name/     { next }
-    /^No configuration/       { next }
     NF == 0                   { next }
     { print $1 }
   '
+}
+
+# ── 보관된 .ovpn ────────────────────────────────────────────────────────
+# import 할 때 원본을 DATA_DIR 에 보관한다. 프로파일이 사라져도 사용자에게
+# 파일을 다시 고르라고 하지 않고 이걸로 복구한다.
+stored_ovpn() {
+  ls -1t "$DATA_DIR"/*.ovpn "$DATA_DIR"/*.conf 2>/dev/null | head -1
+}
+
+# 프로파일이 없고 보관본이 있으면 다시 import 한다.
+ensure_config() {
+  backend_ready || { echo "vpn-ctl: openvpn3 응답 없음 (잠시 후 재시도)" >&2; return 1; }
+  local cfg; cfg="$(configs_list_names | head -1)"
+  [ -n "$cfg" ] && { printf '%s\n' "$cfg"; return 0; }
+
+  local src; src="$(stored_ovpn)"
+  [ -n "$src" ] || return 1
+
+  cfg="$(basename "$src")"; cfg="${cfg%.*}"
+  echo "vpn-ctl: 프로파일이 없어 보관본으로 복구합니다: $(basename "$src")" >&2
+  openvpn3 config-import --config "$src" --persistent --name "$cfg" >/dev/null 2>&1 || return 1
+  CONFIGS_RAW=""   # 캐시 무효화
+  printf '%s\n' "$cfg"
 }
 
 # 프로파일 이름을 결정한다. 인자로 주면 그것, 없으면 import 된 첫 번째.
@@ -133,9 +179,30 @@ cmd_status() {
     return 0
   fi
 
+  if ! backend_ready; then
+    # 조회 자체가 안 된 상태. 프로파일이 없다고 단정하지 않는다.
+    state="backend-busy"
+    detail="openvpn3 서비스 응답 대기 중"
+    emit_or_print "$state" "$detail" "$cfg" "$actionable" "$as_json"
+    return 0
+  fi
+
   cfg="$(resolve_config "$want")"
 
-  if ! config_imported "$cfg"; then
+  # 프로파일이 없는데 보관본이 있으면 **조용히 복원한다.**
+  # 사용자는 이미 한 번 .ovpn 을 등록했다. 그 결정을 다시 묻지 않는다 —
+  # openvpn3 프로파일은 D-Bus 서비스 상태에 따라 사라질 수 있지만,
+  # 우리가 원본을 들고 있으므로 그건 사용자가 알 필요 없는 내부 사정이다.
+  if [ -z "$cfg" ] || ! config_imported "$cfg"; then
+    if [ -n "$(stored_ovpn)" ]; then
+      cfg="$(ensure_config 2>/dev/null)"
+      # ensure_config 는 서브셸에서 돌았으므로 그 안의 캐시 무효화가 여기까지
+      # 오지 않는다. 부모 셸에서 직접 비워 재조회하게 한다.
+      CONFIGS_RAW=""; CONFIGS_OK=0
+    fi
+  fi
+
+  if [ -z "$cfg" ] || ! config_imported "$cfg"; then
     state="missing-config"
     detail="VPN 프로파일이 등록되지 않았습니다"
     actionable=""
@@ -244,8 +311,11 @@ case "$CMD" in
     ;;
   up)
     [ ${#POSITIONAL[@]} -gt 0 ] && CONFIG="${POSITIONAL[0]}"
-    CONFIG="$(resolve_config "$CONFIG")"
-    [ -n "$CONFIG" ] || { echo "vpn-ctl up: import 된 프로파일이 없습니다" >&2; exit 1; }
+    if [ -z "$CONFIG" ]; then
+      # 프로파일이 없으면 보관본으로 복구를 시도한다 — 사용자에게 다시 묻지 않는다.
+      CONFIG="$(ensure_config)" || {
+        echo "vpn-ctl up: 프로파일이 없고 보관된 .ovpn 도 없습니다" >&2; exit 1; }
+    fi
     delegate vpn-up "$CONFIG"
     ;;
   down)
@@ -256,6 +326,9 @@ case "$CMD" in
     ;;
   auth-url)
     cmd_auth_url
+    ;;
+  ensure-config)
+    ensure_config >/dev/null && echo "프로파일 준비됨" || { echo "복구 실패" >&2; exit 1; }
     ;;
   import)
     [ ${#POSITIONAL[@]} -ge 1 ] || { echo "usage: vpn-ctl import <file> [config]" >&2; exit 2; }

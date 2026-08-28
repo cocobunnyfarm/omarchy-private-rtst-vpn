@@ -11,7 +11,8 @@ import qs.Ui
 //
 // 화면은 준비 상태에 따라 단계적으로 바뀐다:
 //   missing-backend → openvpn3 설치 안내만 보여준다 (그 전엔 나머지가 무의미)
-//   missing-config  → .ovpn 파일 선택 UI
+//   missing-config  → .ovpn 파일 선택 UI (최초 1회. 보관본이 있으면 코어가
+//                      조용히 복원하므로 이 화면이 다시 나오지 않는다)
 //   그 외           → 정상 연결/끊기 UI
 // ─────────────────────────────────────────────────────────────────────────
 BarWidget {
@@ -36,13 +37,18 @@ BarWidget {
 
   readonly property bool busy: statusProc.running || actionProc.running
                                || pickProc.running || importProc.running
+                               || recoverProc.running
 
   // 아이콘은 두 종류만 쓴다 — 바에 위젯이 여러 개라 종류가 많으면 헷갈린다.
   //   󰦝 온전한 쉴드  : 쓸 준비가 된 상태 (연결됨 / 미연결 / 인증 중)
   //   󰦞 금간 쉴드    : 쓸 수 없는 상태 (백엔드·프로파일 없음 / 오류)
+  // backend-busy / loading 은 "프로파일 없음" 이 아니라 "아직 모름" 이다.
+  // 금간 쉴드를 보여주면 사용자가 뭔가 깨진 줄 알게 되므로 온전한 쉴드로 둔다.
   readonly property bool usable: vpnState === "connected"
                                  || vpnState === "disconnected"
                                  || vpnState === "authenticating"
+                                 || vpnState === "backend-busy"
+                                 || vpnState === "loading"
 
   readonly property string glyph: usable ? "󰦝" : "󰦞"
 
@@ -56,9 +62,10 @@ BarWidget {
   // 사람이 읽는 제목
   readonly property string headline: {
     switch (vpnState) {
-      case "loading":         return "확인 중…"
-      case "missing-backend": return "openvpn3 설치 필요"
-      case "missing-config":  return "VPN 프로파일 없음"
+      case "loading":            return "확인 중…"
+      case "backend-busy":       return "확인 중…"
+      case "missing-backend":    return "openvpn3 설치 필요"
+      case "missing-config":     return "VPN 프로파일 없음"
       case "disconnected":    return "연결 안 됨"
       case "authenticating":  return "브라우저에서 로그인 대기"
       case "connected":       return "연결됨"
@@ -153,6 +160,23 @@ BarWidget {
   }
 
   function pickConfig() { if (!pickProc.running) pickProc.running = true }
+
+  // 보관된 .ovpn 으로 프로파일을 복구한다 — 사용자에게 파일을 다시 묻지 않는다.
+  Process {
+    id: recoverProc
+    command: [root.backendCommand, "ensure-config"]
+    stderr: StdioCollector { id: recoverErr; waitForEnd: true }
+    onExited: function(code) {
+      if (code !== 0) root.lastError = recoverErr.text.trim() || "프로파일 복구 실패"
+      root.refreshNow()
+    }
+  }
+
+  function recoverConfig() {
+    if (recoverProc.running) return
+    root.lastError = ""
+    recoverProc.running = true
+  }
 
   function importConfig(path) {
     if (importProc.running) return
@@ -286,6 +310,7 @@ BarWidget {
         Text {
           visible: root.detail.length > 0 && root.vpnState !== "missing-backend"
                    && root.vpnState !== "missing-config"
+                   && root.vpnState !== "missing-config"
           text: root.detail
           width: parent.width
           wrapMode: Text.WordWrap
@@ -329,7 +354,9 @@ BarWidget {
           }
         }
 
-        // ── 2단계: 프로파일 미 import ───────────────────────────────────
+        // ── 2단계: 프로파일 없음 (최초 설정) ────────────────────────────
+        // 보관본이 있으면 코어가 조용히 복원하므로 이 화면은 정말 처음일 때만
+        // 나온다. "복구할까요?" 를 묻지 않는다 — 이미 한 결정을 다시 묻는 것이므로.
         Column {
           visible: root.vpnState === "missing-config"
           width: parent.width
@@ -397,6 +424,23 @@ BarWidget {
             bordered: true
             enabled: !urlProc.running && !copyProc.running
             onClicked: root.copyAuthUrl()
+          }
+
+          // 설정 변경은 연결이 끊긴 상태에서만 노출한다 — 연결 중에 프로파일을
+          // 갈아치우면 세션과 어긋난다.
+          Column {
+            visible: root.vpnState === "disconnected"
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSeparator { width: parent.width }
+
+            Button {
+              text: root.busy ? "처리 중…" : ".ovpn 변경"
+              bordered: true
+              enabled: !root.busy
+              onClicked: root.pickConfig()
+            }
           }
         }
 
