@@ -18,8 +18,7 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 15,
-      "ctlCommand": "vpn-ctl",
-      "configName": "hell"
+      "ctlCommand": "vpn-ctl"
     },
     "schema": [
       {

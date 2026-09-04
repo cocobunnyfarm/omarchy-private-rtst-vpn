@@ -11,9 +11,9 @@ import qs.Ui
 //
 // 화면은 준비 상태에 따라 단계적으로 바뀐다:
 //   missing-backend → openvpn3 설치 안내만 보여준다 (그 전엔 나머지가 무의미)
-//   missing-config  → .ovpn 파일 선택 UI (최초 1회. 보관본이 있으면 코어가
-//                      조용히 복원하므로 이 화면이 다시 나오지 않는다)
-//   그 외           → 정상 연결/끊기 UI
+//   missing-config  → .ovpn 파일 선택 UI. 사용자가 아직 아무 파일도 고르지
+//                      않은 상태이므로 연결 버튼은 아예 나오지 않는다
+//   그 외           → 정상 연결/끊기 UI + 끊긴 상태에서만 프로파일 관리
 // ─────────────────────────────────────────────────────────────────────────
 BarWidget {
   id: root
@@ -25,9 +25,23 @@ BarWidget {
     String(Qt.resolvedUrl("core/vpn-ctl")).replace(/^file:\/\//, "")
 
   readonly property int refreshSec: setting("refreshIntervalSec", 15)
-  readonly property string configName: setting("configName", "hell")
 
   // vpn-ctl status --json 파싱 결과
+  // 프로파일 이름은 코어가 정한다. UI 는 status 가 알려준 것을 받아 보여줄 뿐,
+  // 어떤 명령에도 이름을 넘기지 않는다 — 넘기는 순간 코어의 자동 발견/복구와
+  // 어긋나서, 복구된 프로파일에 대고 없는 이름으로 연결을 시도하게 된다.
+  property string activeConfig: ""
+
+  // 보관된 .ovpn 목록: [{ name, file, active }, …]
+  // 코어의 보관소($XDG_CONFIG_HOME/rtst-vpn)가 유일한 근거다. status 가
+  // 매번 함께 실어 주므로 따로 조회하지 않는다 — 목록과 상태가 어긋날 수 없다.
+  property var profiles: []
+  readonly property bool hasProfile: profiles.length > 0
+
+  // 삭제 2단계 확인. 패널 안에서 끝내려고 ConfirmDialog 대신 버튼 자체가
+  // "정말?" 로 바뀌는 방식을 쓴다.
+  property string pendingForget: ""
+
   property string vpnState: "loading"
   property string detail: ""
   property string actionable: ""
@@ -37,7 +51,6 @@ BarWidget {
 
   readonly property bool busy: statusProc.running || actionProc.running
                                || pickProc.running || importProc.running
-                               || recoverProc.running
 
   // 아이콘은 두 종류만 쓴다 — 바에 위젯이 여러 개라 종류가 많으면 헷갈린다.
   //   󰦝 온전한 쉴드  : 쓸 준비가 된 상태 (연결됨 / 미연결 / 인증 중)
@@ -65,7 +78,7 @@ BarWidget {
       case "loading":            return "확인 중…"
       case "backend-busy":       return "확인 중…"
       case "missing-backend":    return "openvpn3 설치 필요"
-      case "missing-config":     return "VPN 프로파일 없음"
+      case "missing-config":     return ".ovpn 파일 등록 필요"
       case "disconnected":    return "연결 안 됨"
       case "authenticating":  return "브라우저에서 로그인 대기"
       case "connected":       return "연결됨"
@@ -77,7 +90,7 @@ BarWidget {
   // ── 상태 조회 ─────────────────────────────────────────────────────────
   Process {
     id: statusProc
-    command: [root.backendCommand, "status", "--json", root.configName]
+    command: [root.backendCommand, "status", "--json"]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     stderr: StdioCollector { id: statusErr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -91,12 +104,15 @@ BarWidget {
       try {
         var d = JSON.parse(statusOut.text)
         root.vpnState = d.state || "error"
+        root.activeConfig = d.config || ""
+        root.profiles = d.profiles || []
         root.detail = d.detail || ""
         root.actionable = d.actionable || ""
       } catch (e) {
         root.vpnState = "backend-failed"
         root.detail = "status JSON 파싱 실패: " + statusOut.text.trim().slice(0, 120)
         root.actionable = ""
+        root.profiles = []
       }
     }
   }
@@ -128,8 +144,8 @@ BarWidget {
     actionProc.running = true
   }
 
-  function connectVpn()    { runAction(["up", root.configName]) }
-  function disconnectVpn() { runAction(["down", root.configName]) }
+  function connectVpn()    { runAction(["up"]) }
+  function disconnectVpn() { runAction(["down"]) }
 
   // ── .ovpn 파일 선택 → import ──────────────────────────────────────────
   // Omarchy 공식 파일 선택기. 종료코드 1 = 아무것도 안 고름(정상),
@@ -161,27 +177,32 @@ BarWidget {
 
   function pickConfig() { if (!pickProc.running) pickProc.running = true }
 
-  // 보관된 .ovpn 으로 프로파일을 복구한다 — 사용자에게 파일을 다시 묻지 않는다.
-  Process {
-    id: recoverProc
-    command: [root.backendCommand, "ensure-config"]
-    stderr: StdioCollector { id: recoverErr; waitForEnd: true }
-    onExited: function(code) {
-      if (code !== 0) root.lastError = recoverErr.text.trim() || "프로파일 복구 실패"
-      root.refreshNow()
-    }
+  // ── 프로파일 관리 ────────────────────────────────────────────────────
+  // 활성 전환·삭제는 코어에 그대로 넘긴다. UI 는 어느 파일이 활성인지도
+  // 스스로 기억하지 않는다 — 다음 status 가 알려 준다.
+  function useProfile(name) {
+    root.pendingForget = ""
+    runAction(["use", name])
   }
 
-  function recoverConfig() {
-    if (recoverProc.running) return
-    root.lastError = ""
-    recoverProc.running = true
+  function forgetProfile(name) {
+    root.pendingForget = ""
+    runAction(["forget", name])
   }
+
+  // 첫 클릭은 확인을 요청하고, 같은 항목을 다시 누르면 실제로 지운다.
+  function requestForget(name) {
+    if (root.pendingForget === name) { root.forgetProfile(name); return }
+    root.pendingForget = name
+    forgetReset.restart()
+  }
+
+  Timer { id: forgetReset; interval: 4000; onTriggered: root.pendingForget = "" }
 
   function importConfig(path) {
     if (importProc.running) return
     root.lastError = ""
-    importProc.command = [root.backendCommand, "import", path, root.configName]
+    importProc.command = [root.backendCommand, "import", path]
     importProc.running = true
   }
 
@@ -245,7 +266,7 @@ BarWidget {
   // ── 팝업 라우팅 계약 ──────────────────────────────────────────────────
   property bool panelOpen: false
   readonly property bool opened: panelOpen
-  function open() { panelOpen = true; urlCopied = false; refreshNow() }
+  function open() { panelOpen = true; urlCopied = false; pendingForget = ""; refreshNow() }
   function close() { panelOpen = false }
   function togglePanel() { panelOpen ? close() : open() }
 
@@ -307,9 +328,20 @@ BarWidget {
           font.bold: true
         }
 
+        // 어느 프로파일로 연결됐는지. 연결/인증 중에는 프로파일 관리 목록이
+        // 숨겨지므로, 이게 없으면 "무엇으로 붙었는지" 를 볼 방법이 없다.
+        Text {
+          visible: root.activeConfig.length > 0
+                   && root.vpnState !== "missing-backend"
+                   && root.vpnState !== "missing-config"
+          text: "󰦝  " + root.activeConfig
+          color: Qt.darker(Color.foreground, 1.2)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
         Text {
           visible: root.detail.length > 0 && root.vpnState !== "missing-backend"
-                   && root.vpnState !== "missing-config"
                    && root.vpnState !== "missing-config"
           text: root.detail
           width: parent.width
@@ -389,11 +421,14 @@ BarWidget {
 
           PanelSeparator { width: parent.width }
 
+          // 등록된 .ovpn 이 없으면 누를 수 없다. disconnected 자체가 이미
+          // "활성 프로파일이 있다" 는 뜻이지만, 상태와 목록이 어긋나는 순간이
+          // 있더라도 연결을 시도하지 않도록 hasProfile 을 함께 본다.
           Button {
             visible: root.vpnState === "disconnected"
             text: root.busy ? "연결 중…" : "연결"
             bordered: true
-            enabled: !root.busy
+            enabled: !root.busy && root.hasProfile
             onClicked: root.connectVpn()
           }
 
@@ -426,8 +461,8 @@ BarWidget {
             onClicked: root.copyAuthUrl()
           }
 
-          // 설정 변경은 연결이 끊긴 상태에서만 노출한다 — 연결 중에 프로파일을
-          // 갈아치우면 세션과 어긋난다.
+          // 프로파일 관리는 연결이 끊긴 상태에서만 노출한다 — 연결 중에
+          // 프로파일을 갈아치우면 살아 있는 세션과 어긋난다.
           Column {
             visible: root.vpnState === "disconnected"
             width: parent.width
@@ -435,11 +470,64 @@ BarWidget {
 
             PanelSeparator { width: parent.width }
 
+            PanelSectionHeader { text: "프로파일" }
+
+            // 한 줄에 하나. 이름을 누르면 활성 전환, 오른쪽 버튼으로 삭제.
+            // 보통 1개뿐이라 드롭다운보다 목록이 낫다 — 몇 개가 있고 어느
+            // 것이 활성인지 펼치지 않고 바로 보인다.
+            Repeater {
+              model: root.profiles
+
+              delegate: Row {
+                id: profileRow
+                // Repeater 가 넘겨주는 항목. 자식에서 맨몸의 modelData 를 쓰면
+                // 델리게이트 컨텍스트에 암묵적으로 의존하게 되므로 명시한다.
+                required property var modelData
+
+                width: parent.width
+                spacing: Style.space(6)
+
+                readonly property bool isActive: profileRow.modelData.active === true
+                readonly property string profileName: String(profileRow.modelData.name)
+
+                Button {
+                  width: profileRow.width - delBtn.width - Style.space(6)
+                  leftAlign: true
+                  bordered: profileRow.isActive
+                  selected: profileRow.isActive
+                  text: (profileRow.isActive ? "󰄬  " : "     ") + profileRow.profileName
+                  tooltipText: profileRow.isActive ? "활성 프로파일" : "이 프로파일로 전환"
+                  enabled: !root.busy && !profileRow.isActive
+                  onClicked: root.useProfile(profileRow.profileName)
+                }
+
+                Button {
+                  id: delBtn
+                  bordered: true
+                  text: root.pendingForget === profileRow.profileName ? "정말?" : "삭제"
+                  tooltipText: root.pendingForget === profileRow.profileName
+                               ? "다시 누르면 보관본까지 삭제됩니다"
+                               : "보관된 .ovpn 을 삭제"
+                  enabled: !root.busy
+                  onClicked: root.requestForget(profileRow.profileName)
+                }
+              }
+            }
+
             Button {
-              text: root.busy ? "처리 중…" : ".ovpn 변경"
+              text: root.busy ? "처리 중…" : ".ovpn 추가"
               bordered: true
               enabled: !root.busy
               onClicked: root.pickConfig()
+            }
+
+            Text {
+              text: "보관 위치: ~/.config/rtst-vpn"
+              width: parent.width
+              wrapMode: Text.WordWrap
+              color: Qt.darker(Color.foreground, 1.5)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
             }
           }
         }

@@ -44,7 +44,9 @@ cd omarchy-private-rtst-vpn
 ./install-core.sh          # core/* -> ~/.local/bin/
 vpn-up                     # 연결
 vpn-down                   # 끊기
+vpn-ctl import ~/hell.ovpn # .ovpn 등록 (최초 1회)
 vpn-ctl status --json      # 상태 (JSON)
+vpn-ctl profiles           # 보관된 .ovpn 목록
 ```
 
 ---
@@ -60,14 +62,43 @@ vpn-ctl status --json      # 상태 조회. 항상 종료코드 0, 상태는 JSO
 vpn-ctl up [config]        # 연결 시작 (브라우저는 열지 않고 URL 만 출력)
 vpn-ctl down [config]      # 끊기 + 좀비 세션 정리
 vpn-ctl auth-url           # 현재 세션의 SSO 인증 URL (원하는 브라우저에서 열면 연결)
-vpn-ctl import <file>      # .ovpn 보관 + import. 프로파일 이름은 파일명에서 유도
+vpn-ctl import <file>      # .ovpn 보관 + 활성 지정 + openvpn3 등록
+vpn-ctl profiles [--json]  # 보관된 .ovpn 목록 (활성 표시)
+vpn-ctl use <name>         # 활성 프로파일 전환
+vpn-ctl forget <name>      # 보관본 + openvpn3 프로파일 삭제
 ```
 
-config 인자를 생략하면 `openvpn3 configs-list` 에서 첫 프로파일을 발견한다 —
-매직 상수(`hell` 같은 것)를 두지 않는다.
+config 인자는 CLI 편의용이며, **위젯은 어떤 명령에도 이름을 넘기지 않는다.**
+이름 결정권은 코어 한 곳에 있다 — 매직 상수(`hell` 같은 것)를 두지 않는다.
+UI 가 이름을 주면 코어의 자동 발견·복구와 어긋나서, 복구된 프로파일에 대고
+존재하지 않는 이름으로 연결을 시도하게 된다. (실제로 겪었다.)
+
+### 보관소 = 등록 여부의 유일한 근거
 
 ```
+~/.config/rtst-vpn/           # $XDG_CONFIG_HOME/rtst-vpn
+├── <name>.ovpn               # 사용자가 고른 원본. 여러 개 가능
+└── active                    # 활성 프로파일 이름 한 줄
 ```
+
+"사용자가 .ovpn 을 등록했는가" 는 **이 디렉터리로만** 판단한다.
+`openvpn3 configs-list` 로 판단하지 않는다 —
+
+- configmgr 은 D-Bus on-demand 서비스라 부팅 직후엔 비어 보일 수 있다
+- 우리가 넣지 않은 프로파일이 들어 있을 수도 있다
+- openvpn3 쪽 프로파일은 실제로 사라진다 (원인 미확정, 아래 «미결» 참조)
+
+그래서 openvpn3 쪽 등록은 **언제든 보관본으로 다시 만들 수 있는 파생 상태**로
+취급한다. `status` / `up` 이 사라진 걸 발견하면 조용히 다시 넣는다 —
+사용자는 이미 한 번 파일을 골랐고, 그 결정을 다시 묻지 않는다.
+
+`active` 파일이 없거나 가리키는 파일이 없으면 **가장 최근에 넣은 것**으로
+승계한다. `active` 가 생기기 전에 `import` 한 사용자도 그대로 동작해야 하므로.
+
+프로파일 이름은 파일명에서 유도한다 (`hansulee-hell.ovpn` → `hansulee-hell`).
+`import` 는 멱등하다 — 같은 이름이 있으면 지우고 다시 넣는다. openvpn3 는
+이름 중복을 막지 않아서, 안 그러면 파일을 다시 고를 때마다 쌓이고
+`configs-list` 첫 줄이 뭔지 예측 불가가 된다.
 
 ### `status --json` 응답
 
@@ -76,22 +107,44 @@ config 인자를 생략하면 `openvpn3 configs-list` 에서 첫 프로파일을
   "state": "disconnected",
   "detail": "세션 없음",
   "config": "hansulee-hell",
-  "actionable": null
+  "actionable": null,
+  "profiles": [
+    { "name": "hansulee-hell", "file": "hansulee-hell.ovpn", "active": true }
+  ]
 }
 ```
+
+`profiles` 를 status 에 함께 실어 보낸다. 별도 조회로 나누면 목록과 상태가
+어긋나는 순간이 생기고, 위젯이 "연결 버튼을 잠글지" 를 두 소스로 판단하게 된다.
 
 | `state` | 뜻 | 위젯 표현 |
 |---|---|---|
 | `missing-backend` | `openvpn3` 미설치 | 금간 쉴드. 클릭 시 설치 안내 |
-| `backend-busy` | openvpn3 서비스 응답 없음 (부팅 직후 등) | 금간 쉴드. "확인 중…" — **프로파일 없다고 단정하지 않는다** |
-| `missing-config` | 프로파일도 보관본도 없음 (최초 1회) | 금간 쉴드. `.ovpn` 선택 버튼 |
-| `disconnected` | 준비됐고 미연결 | 쉴드 (흐림). 연결 / `.ovpn` 변경 |
+| `missing-config` | **사용자가 .ovpn 을 등록한 적이 없다** | 금간 쉴드. `.ovpn` 선택 버튼만. 연결 버튼은 아예 없다 |
+| `backend-busy` | openvpn3 서비스 응답 없음 (부팅 직후 등) | 쉴드. "확인 중…" — **연결 여부를 단정하지 않는다** |
+| `disconnected` | 준비됐고 미연결 | 쉴드 (흐림). 연결 + 프로파일 관리 |
 | `authenticating` | SSO 인증 대기 | 쉴드 (흐림). 인증 URL 복사 버튼 |
 | `connected` | 연결됨 | 쉴드 (밝게) |
-| `error` | 그 외 | 금간 쉴드 + `detail` |
+| `error` | 그 외 (보관본이 있는데 등록에 실패 등) | 금간 쉴드 + `detail` |
+
+`missing-config` 는 백엔드 응답 여부와 **무관하게** 확정할 수 있으므로
+`backend-busy` 보다 먼저 판정한다. "아직 아무것도 고르지 않았다" 는
+openvpn3 사정과 상관없는 사실이고, 위젯은 이걸 알아야 연결을 잠글 수 있다.
 
 `actionable` 은 사용자가 실행해야 하는 명령 문자열(또는 `null`).
 **위젯은 이걸 자동 실행하지 않는다** — 아래 참조.
+
+### 프로파일 관리 UI
+
+연결이 **끊긴 상태에서만** 노출한다 — 연결 중에 프로파일을 갈아치우면 살아
+있는 세션과 어긋난다.
+
+- 한 줄에 하나. 활성인 것은 `󰄬` 표시 + 테두리. 이름을 누르면 `use` 로 전환
+- `삭제` 는 2단계 — 한 번 더 누르면 실제로 지운다 (`forget`). 4초 후 취소
+- `.ovpn 추가` 로 파일을 더 넣는다. 방금 넣은 것이 활성이 된다
+
+보통 1개뿐이라 드롭다운 대신 목록을 쓴다 — 몇 개가 있고 어느 것이 활성인지
+펼치지 않고 바로 보인다.
 
 ---
 
@@ -213,6 +266,22 @@ omarchy plugin enable  io.github.cocobunnyfarm.rtst-vpn right
 
 ### 미결
 
+- **openvpn3 프로파일이 왜 사라지는가.** `--persistent` 로 넣고
+  `config-manage --show` 도 `Persistent config: Yes` 인데, 상태 디렉터리가
+  비어 있다:
+
+  ```
+  /var/lib/openvpn3/configs   root:root 755   (파일 0개)
+  configmgr 프로세스는 openvpn 유저로 실행
+  ```
+
+  쓰기 권한이 없어 보이지만, 부팅 로그엔
+  `Parsed persistent configuration 'hansulee-hell'` 이 찍혀 있어 재부팅을
+  넘긴 것도 사실이다 (로드 후 파일을 지우고 종료 시 다시 쓰는 방식일 수 있다).
+  파고들려면 root 가 필요해 멈췄다.
+
+  다만 보관소가 등록 여부의 근거이므로 **사라져도 사용자 눈에는 안 보인다** —
+  `status` / `up` 이 조용히 다시 넣는다. 증상이 아니라 원인만 미결이다.
 - `dimmed` 기반 아이콘 밝기: 연결 상태에서 밝아지는지 **육안 검증 안 됨**
 - 브라우저 **선택**(억제가 아니라 특정 브라우저로 열기)은 미구현.
   같은 기법으로 가능하다 — 임시 `mimeapps.list` 에
