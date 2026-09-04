@@ -226,20 +226,40 @@ config_imported() {
   configs_list_names | grep -qxF "$cfg"
 }
 
-# sessions-list 에서 해당 config 의 Status 줄을 뽑는다.
-# 출력 형식(기존 vpn-up/vpn-down awk 기준):
+# 살아 있는 세션 전부를 "<config><TAB><status>" 로 나열한다.
+# sessions-list 출력 형식:
 #   Path: /net/openvpn/v3/sessions/...
 #    Config name: <name>
 #    Status: <text>
-session_status_text() {
-  local cfg="$1"
-  openvpn3 sessions-list 2>/dev/null | awk -v cfg="$cfg" '
-    /^ *Path:/         { path=$2 }
-    /^ *Config name:/  { name=$3 }
+sessions_all() {
+  openvpn3 sessions-list 2>/dev/null | awk '
+    /^ *Config name:/ { name=$3 }
     /^ *Status:/ {
-      if (name==cfg) { sub(/^ *Status: */, ""); print; exit }
+      if (name != "") {
+        s=$0; sub(/^ *Status: */, "", s)
+        print name "\t" s
+        name=""
+      }
     }
   '
+}
+
+session_status_text() {
+  local cfg="$1"
+  [ -n "$cfg" ] || return 0
+  sessions_all | awk -F'\t' -v c="$cfg" '$1==c { print $2; exit }'
+}
+
+# 끊을 대상. 활성 프로파일에 세션이 있으면 그것, 없으면 아무 세션이나.
+# 활성 이름만 보고 끊으면 다른 이름으로 남은 세션을 영원히 못 치운다.
+session_config_or_active() {
+  local a; a="$(active_name)"
+  if [ -n "$a" ] && [ -n "$(session_status_text "$a")" ]; then
+    printf '%s\n' "$a"; return 0
+  fi
+  local o; o="$(sessions_all | head -1 | cut -f1)"
+  if [ -n "$o" ]; then printf '%s\n' "$o"; return 0; fi
+  printf '%s\n' "$a"
 }
 
 # ── auth-url ────────────────────────────────────────────────────────────
@@ -305,8 +325,21 @@ cmd_status() {
     state="error"
     detail="프로파일 '$cfg' 을 openvpn3 에 등록할 수 없습니다"
   else
-    local st
+    local st other
     st="$(session_status_text "$cfg")"
+
+    # 활성 프로파일에 세션이 없어도 **다른 이름**으로 살아 있는 세션이 있으면
+    # "끊김" 이라고 말하면 안 된다 — 실제로는 연결/인증 중이다. 그대로 두면
+    # 위젯이 연결 버튼을 내주고, 사용자는 눌러도 아무 일이 없는 것처럼 본다.
+    # 이때 config 는 세션의 실제 이름으로 바꿔 보고한다 — 끊을 대상이 그거니까.
+    if [ -z "$st" ]; then
+      other="$(sessions_all | head -1)"
+      if [ -n "$other" ]; then
+        cfg="$(printf '%s' "$other" | cut -f1)"
+        st="$(printf '%s' "$other" | cut -f2-)"
+      fi
+    fi
+
     if [ -z "$st" ]; then
       state="disconnected"
       detail="세션 없음"
@@ -424,17 +457,27 @@ cmd_import() {
   mkdir -p "$DATA_DIR"
   chmod 700 "$DATA_DIR"
 
-  local dest="$DATA_DIR/$(basename "$src")"
-  # 원본이 이미 보관소 안의 파일이면 복사하지 않는다 (use/재등록 경로).
-  if [ "$(readlink -f "$src")" != "$(readlink -f "$dest" 2>/dev/null)" ]; then
-    install -m 600 "$src" "$dest"
-    echo "보관: $dest"
-  fi
-
   # 프로파일 이름은 파일명에서 유도한다 — 매직 상수를 두지 않는다.
   # rtst-vpn.ovpn -> "rtst-vpn"
   if [ -z "$cfg" ]; then
     cfg="$(profile_name_of "$src")"
+  fi
+
+  # **보관 파일명은 언제나 프로파일 이름과 같아야 한다.**
+  # 이름을 따로 받았을 때 원본 파일명 그대로 보관하면 active 마커가
+  # 보관본으로 되짚을 수 없는 이름을 가리키게 되고, 그때부터
+  #   보관본 = hansulee-hell / openvpn3 = hell / active = hell
+  # 처럼 세 갈래로 갈라진다. 그러면 status 는 hansulee-hell 을 보고 "세션
+  # 없음" 이라 하는데 실제 세션은 hell 로 살아 있다 — 연결이 됐는데도
+  # 첫 화면으로 되돌아가는 것처럼 보인다. (실제로 겪었다.)
+  local ext="${src##*.}"
+  [ "$ext" = "$src" ] && ext="ovpn"
+  local dest="$DATA_DIR/$cfg.$ext"
+
+  # 원본이 이미 그 자리에 있으면 복사하지 않는다 (재등록 경로).
+  if [ "$(readlink -f "$src")" != "$(readlink -f "$dest" 2>/dev/null)" ]; then
+    install -m 600 "$src" "$dest"
+    echo "보관: $dest"
   fi
 
   import_to_backend "$dest" "$cfg" || exit 1
@@ -481,7 +524,7 @@ case "$CMD" in
     ;;
   down)
     [ ${#POSITIONAL[@]} -gt 0 ] && CONFIG="${POSITIONAL[0]}"
-    [ -n "$CONFIG" ] || CONFIG="$(active_name)"
+    [ -n "$CONFIG" ] || CONFIG="$(session_config_or_active)"
     [ -n "$CONFIG" ] || { echo "vpn-ctl down: 등록된 .ovpn 이 없습니다" >&2; exit 1; }
     delegate vpn-down "$CONFIG"
     ;;
