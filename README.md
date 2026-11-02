@@ -18,6 +18,9 @@ RTST 사내망 VPN (openvpn3 + Google SSO) — **코어 CLI + Omarchy 바 위젯
 │   ├── vpn-ctl        ├─ 코어 레이어 — Omarchy 없이 단독 동작
 │   ├── vpn-up         │   평범한 CLI 라 우분투·서버에서도 그대로 쓴다
 │   └── vpn-down       ┘
+│
+├── install-core.sh       CLI 용: core/* → ~/.local/bin/
+└── dev-reload.sh         개발용: Widget.qml 을 설치된 위젯에 즉시 반영 (아래 «개발 중 리로드»)
 ```
 
 **UI 는 코어를 `Process` 로 호출해 JSON 을 받아 그리기만 한다.** 로직은 전부 코어에.
@@ -33,6 +36,16 @@ omarchy plugin add git@github.com:cocobunnyfarm/omarchy-private-rtst-vpn.git --e
 
 private repo 라도 `omarchy plugin add` 는 내부적으로 `git clone` 이므로
 SSH 키가 로드돼 있으면 그대로 동작한다 (keychain 사용 시 자동).
+
+**반드시 위의 SSH 주소(`git@github.com:...`)로 설치할 것.** `https://` 주소로
+설치하면 설치본의 remote 가 HTTPS 가 되어, `ssh-add -l` 에 키가 있어도 git 이
+키를 쓰지 않고 유저네임/토큰을 물어 `plugin update` 가 실패한다 (새 OS 에서 겪었다).
+이미 그렇게 됐다면:
+
+```bash
+git -C ~/.config/omarchy/plugins/io.github.cocobunnyfarm.rtst-vpn \
+  remote set-url origin git@github.com:cocobunnyfarm/omarchy-private-rtst-vpn.git
+```
 
 `core/` 도 함께 클론되므로 별도 설치 없이 self-contained 로 돈다.
 
@@ -188,6 +201,12 @@ omarchy-launch-floating-terminal-with-presentation 'omarchy pkg aur add openvpn3
 Omarchy 가 자기 `Install →` 메뉴에서 쓰는 방식이라 sudo 프롬프트가 정상 동작하고
 빌드 과정이 눈에 보인다.
 
+위젯의 **`AUR 설치 메뉴`** 버튼은 Omarchy 의 AUR 설치기(`Install > AUR` 의 fzf)를
+**검색어 `openvpn3` 가 채워진 채로** 띄운다 — 사용자는 Enter 만 누르면 된다.
+`omarchy menu summon install.aur` 는 빈 검색창만 띄우고 검색어를 넘길 방법이
+없어서, 메뉴 항목과 같은 명령을 직접 실행하고 `FZF_DEFAULT_OPTS` 에
+`--query=openvpn3` 를 덧붙인다 (사용자의 기존 값은 보존).
+
 ### `.ovpn` 은 사람이 골라야 하지만, 고르는 것 자체는 위젯이 돕는다
 
 파일을 **가져오는** 것은 자동화할 수 없다 (사내 자산). 하지만 **고르는** 것은
@@ -293,8 +312,24 @@ import 후에는 openvpn3 가 프로파일을 자체 저장소(`/var/lib/openvpn
 `dev-reload.sh` 는 매번 `dev-<타임스탬프>/` 에 복사하고 manifest 의
 `entryPoints.barWidget` 을 그쪽으로 돌려서 캐시를 피한다.
 
-주의: 개발 모드에서는 설치본의 `manifest.json` 이 바뀌어 있어 `plugin update`
-(= git pull) 가 충돌할 수 있다. 끝나면 `--off`.
+주의: 개발 모드는 **재부팅해도 풀리지 않는다** (설치본 파일을 바꾼 상태라서).
+켜둔 채 두면 위젯은 마지막 반영본으로 잘 돌지만, 설치본의 `manifest.json` 이
+바뀌어 있어 `plugin update`(= git pull) 가 충돌하고, 설치본 `core/` 가 이 repo 를
+가리키므로 repo 를 옮기면 위젯이 깨진다.
+
+**개발을 마칠 때는 이 순서로** — `--off` 만 하면 설치본이 마지막 pull 시점의
+옛 버전으로 돌아간다:
+
+```bash
+git commit … && git push
+./dev-reload.sh --off
+omarchy plugin update io.github.cocobunnyfarm.rtst-vpn
+#   또는 푸시 없이 로컬 repo 에서 바로:
+#   git -C ~/.config/omarchy/plugins/io.github.cocobunnyfarm.rtst-vpn pull --ff-only "$PWD" master
+```
+
+`--off` 직후엔 같은 경로(`Widget.qml`)를 다시 쓰므로 캐시 때문에 로그아웃 전까지
+화면에 옛 위젯이 보일 수 있다. 동작에는 지장 없다.
 
 **확인은 화면으로.** "reloading" 로그는 반영의 증거가 아니다. 확실한 증거는
 경고 로그에 찍히는 파일 경로·줄번호가 새 것인지:
