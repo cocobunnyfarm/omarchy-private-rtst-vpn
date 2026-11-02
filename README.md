@@ -263,50 +263,47 @@ import 후에는 openvpn3 가 프로파일을 자체 저장소(`/var/lib/openvpn
 
 ### 개발 중 리로드 방법 (중요)
 
-| 방법 | 결과 |
-|---|---|
-| 파일 저장 (핫리로드) | ❌ 안 먹음 |
-| `omarchy-shell shell rescanPlugins` | ❌ 안 먹음 |
-| `plugin disable` → `enable` | ❌ **안 먹는 경우가 있다** (아래) |
-| `omarchy restart shell` | 바·알림·배경·**잠금화면**까지 재시작 — 반복하면 잠금화면이 깨진다 |
-| 로그아웃 / 재부팅 | ✅ 확실함 |
-
-**`plugin disable` → `enable` 은 믿을 수 없다.** 2026-09-04 에 겪었다:
-`Widget.qml` 을 바꿔 배포한 뒤 disable→enable 을 세 번, `rescanPlugins` 까지
-했는데도 **옛 위젯이 계속 렌더링됐다.** 디스크에는 옛 문자열이 남아 있지
-않은데(`grep -rl` 로 확인) 화면에는 옛 UI 가 나왔다 — 즉 컴파일된 컴포넌트가
-살아 있었다.
-
-`shell.qml` 을 보면 컴포넌트 캐시를 버리는 곳은 `finishPluginReload()` 의
-`Qt.clearComponentCache()` 한 곳뿐이고, 거기 도달하려면 `reloadPlugins()` 를
-통과해야 한다:
-
-```qml
-function reloadPlugins() {
-  if (shell.pluginReloading || shell.pluginRegistry.scanning) {
-    shell.pluginReloadPending = true; return        // ← 여기서 되돌아가면 끝
-  }
-  ...
-}
-```
-
-`pluginReloading` 이 참인 채로 남으면 이후 모든 리로드 요청이 이 줄에서
-되돌아간다. 파일을 여러 개 연속으로 복사하면 `onLocalPluginChanged` 가
-연달아 터지는데(로그에 "Local plugin changed, reloading" 이 6~9번 찍혔다)
-그때 이 상태에 빠지는 것으로 보인다. **원인은 미확정** — 셸 내부 상태를
-읽을 방법이 없어 플래그가 실제로 걸려 있는지는 확인하지 못했다.
-
-**교훈:** UI 를 바꿨으면 화면으로 확인할 것. 로그에 "reloading" 이 찍히는 것도,
-디스크의 파일이 새 것인 것도 반영됐다는 증거가 아니다. 눈으로 볼 때는
+**`./dev-reload.sh --watch` 를 띄워두고 `Widget.qml` 을 저장하면 바로 바뀐다.**
+로그아웃·재부팅 불필요.
 
 ```bash
-omarchy-shell io.github.cocobunnyfarm.rtst-vpn open
-grim -o <output> /tmp/shot.png     # 팝업 영역만 크롭해서 확인
+./dev-reload.sh           # 한 번 반영
+./dev-reload.sh --watch   # 저장할 때마다 자동 반영
+./dev-reload.sh --off     # 개발 모드 해제 (설치본을 git 상태로)
 ```
 
-`omarchy restart shell` 은 `omarchy.lock`(잠금화면)이 같은 프로세스의 플러그인이라
-반복하면 잠금화면이 깨진다. 실제로 겪었다. 그래서 위 표에서도 권하지 않는다 —
-확실히 하려면 로그아웃이나 재부팅이 낫다.
+`core/` 는 repo 를 심볼릭 링크로 가리키므로 `vpn-ctl` 수정은 반영 없이 바로 먹는다.
+
+#### 왜 그냥 덮어쓰면 안 먹는가 (2026-11-02 원인 확인)
+
+셸은 파일 변경을 감지해 리로드하고 `Qt.clearComponentCache()` 도 부른다.
+그런데 Qt 는 **같은 URL 의 컴파일 결과**와 **디렉터리 목록**을 계속 들고 있다.
+실험 결과:
+
+| 방법 | 결과 |
+|---|---|
+| 같은 경로에 덮어쓰기 | ❌ 옛 위젯 그대로 (로그의 `Widget.qml[273]` 줄번호가 옛 파일 기준) |
+| 같은 폴더에 새 파일명 + manifest 수정 | ❌ `File name case mismatch` — 폴더 목록 캐시에 새 파일이 없다 |
+| **새 디렉터리** + manifest 수정 | ✅ 새로 컴파일됨 (줄번호가 새 파일 기준) |
+| 로그아웃 / 재부팅 | ✅ 확실하지만 느리다 |
+| `omarchy restart shell` | 잠금화면까지 재시작 — 반복하면 잠금화면이 깨진다. 쓰지 말 것 |
+
+예전에 의심했던 `pluginReloading` 플래그 고착은 원인이 아니었다 — 리로드는
+매번 정상적으로 돌았고, 다시 로드한 결과가 캐시된 옛 컴파일본이었을 뿐이다.
+`dev-reload.sh` 는 매번 `dev-<타임스탬프>/` 에 복사하고 manifest 의
+`entryPoints.barWidget` 을 그쪽으로 돌려서 캐시를 피한다.
+
+주의: 개발 모드에서는 설치본의 `manifest.json` 이 바뀌어 있어 `plugin update`
+(= git pull) 가 충돌할 수 있다. 끝나면 `--off`.
+
+**확인은 화면으로.** "reloading" 로그는 반영의 증거가 아니다. 확실한 증거는
+경고 로그에 찍히는 파일 경로·줄번호가 새 것인지:
+
+```bash
+journalctl --user --since -10s -o cat | grep rtst-vpn/dev-
+```
+
+`IpcHandler ... will not be used` 경고는 모니터가 2대라 위젯이 2개 떠서 나는 것으로 무해하다.
 
 ### 미결
 

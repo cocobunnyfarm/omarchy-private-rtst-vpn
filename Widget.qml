@@ -255,11 +255,19 @@ BarWidget {
 
   Process { id: menuProc }
 
-  // Omarchy 의 AUR 설치기(fzf 검색)를 바로 띄운다. openvpn3 는 공식 저장소가
-  // 아니라 AUR 이므로 Install > Package 가 아니라 Install > AUR 로 보낸다.
+  // Omarchy 의 AUR 설치기(Install > AUR 의 fzf 검색)를 검색어가 채워진 채로 띄운다.
+  // `omarchy menu summon install.aur` 로 메뉴를 거치면 빈 검색창이 떠서
+  // 사용자가 패키지 이름을 직접 쳐야 했다. 메뉴 항목과 같은 명령을 직접 실행하고
+  // fzf 는 FZF_DEFAULT_OPTS 를 읽으므로 거기에 --query 를 덧붙인다 (기존 값 보존).
+  // 사용자는 Enter 만 누르면 된다 — sudo 프롬프트와 빌드 과정은 그 터미널에 보인다.
+  readonly property string backendPackage: "openvpn3"
+
   function openAurMenu() {
     if (menuProc.running) return
-    menuProc.command = ["omarchy", "menu", "summon", "install.aur"]
+    menuProc.command = ["xdg-terminal-exec", "--app-id=org.omarchy.terminal",
+                        "bash", "-c",
+                        'FZF_DEFAULT_OPTS="$FZF_DEFAULT_OPTS --query=$1" exec omarchy-pkg-aur-install',
+                        "aur-install", root.backendPackage]
     menuProc.running = true
   }
 
