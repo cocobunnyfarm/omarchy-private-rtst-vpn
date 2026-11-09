@@ -169,25 +169,84 @@ active_name() {
   stored_names | head -1
 }
 
-# 같은 이름의 openvpn3 프로파일을 지운다. openvpn3 는 이름 중복을 막지 않아서,
-# 이걸 안 하면 다시 넣을 때마다 쌓이고 configs-list 첫 줄이 뭔지 예측 불가가 된다.
-remove_backend_config() {
+# 이름이 <cfg> 인 openvpn3 프로파일의 D-Bus 경로를 전부 나열한다.
+# 이름으로 지우면(config-remove --config) 중복이 있을 때 openvpn3 가 어느 걸
+# 지울지 몰라 실패한다 — 하필 중복을 치워야 하는 바로 그 순간에. 그래서 경로로 지운다.
+# --json 형식 (v27.1 실측):  "/net/openvpn/v3/configuration/…" : { … "name" : "hell", … }
+backend_config_paths() {
   local cfg="$1"
-  while configs_list_names | grep -qxF "$cfg"; do
-    openvpn3 config-remove --config "$cfg" --force >/dev/null 2>&1 || break
-    CONFIGS_RAW=""; CONFIGS_OK=0
-  done
+  openvpn3 configs-list --json 2>/dev/null | awk -v cfg="$cfg" '
+    match($0, /"\/net\/openvpn\/v3\/configuration\/[^"]+"/) {
+      p = substr($0, RSTART + 1, RLENGTH - 2); next
+    }
+    /^[ \t]*"name"[ \t]*:/ {
+      v = $0
+      sub(/^[^:]*:[ \t]*"/, "", v); sub(/",?[ \t]*$/, "", v)
+      if (v == cfg && p != "") print p
+    }
+  '
+}
+
+# 같은 이름의 openvpn3 프로파일을 전부 지운다. openvpn3 는 이름 중복을 막지 않아서,
+# 이걸 안 하면 다시 넣을 때마다 쌓이고 session-start --config 이름 이 실패한다.
+remove_backend_config() {
+  local cfg="$1" p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    openvpn3 config-remove --path "$p" --force >/dev/null 2>&1 \
+      || echo "vpn-ctl: openvpn3 프로파일 삭제 실패: $p" >&2
+  done <<EOF
+$(backend_config_paths "$cfg")
+EOF
+  CONFIGS_RAW=""; CONFIGS_OK=0
+}
+
+# openvpn3 프로파일을 바꾸는 일(지우고 다시 넣기)은 한 번에 하나만.
+# 위젯은 status 를 주기적으로 부르고 status 는 사라진 프로파일을 복구한다.
+# 같은 순간 사용자가 연결을 누르면 up 도 복구를 시도한다. 잠금 없이는 둘 다
+# "없음" 을 보고 각자 import 해서 같은 이름이 두 개 생긴다. (실제로 겪었다:
+# 같은 초에 import 된 hansulee-hell 두 개 → session-start 실패.)
+#
+# 서브셸 안에서 잠그므로 잠금은 이 호출이 끝나면 풀린다 — up 이 vpn-up 으로
+# exec 될 때까지 쥐고 있지 않는다. 대신 서브셸에서 갱신한 목록 캐시는 부모로
+# 돌아오지 않으므로 여기서 버린다. 중첩 호출 금지 (같은 프로세스가 다시 열면 교착).
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/rtst-vpn-ctl.$(id -u).lock"
+with_backend_lock() {
+  local rc
+  (
+    flock -w 30 9 || { echo "vpn-ctl: openvpn3 프로파일 잠금 대기 초과" >&2; exit 1; }
+    CONFIGS_RAW=""; CONFIGS_OK=0   # 기다리는 동안 다른 쪽이 바꿨을 수 있다
+    "$@"
+  ) 9>"$LOCK_FILE"
+  rc=$?
+  CONFIGS_RAW=""; CONFIGS_OK=0
+  return "$rc"
 }
 
 # 보관본을 openvpn3 에 등록한다. --persistent: 재부팅 후에도 유지.
-import_to_backend() {
+# 잠금 안에서만 부른다 — import_to_backend 를 쓸 것.
+_import_to_backend() {
   local src="$1" cfg="$2"
   remove_backend_config "$cfg"
   openvpn3 config-import --config "$src" --persistent --name "$cfg" >/dev/null || return 1
   CONFIGS_RAW=""; CONFIGS_OK=0
 }
+import_to_backend() { with_backend_lock _import_to_backend "$@"; }
 
-# 활성 프로파일이 openvpn3 에 등록돼 있도록 보장하고 그 이름을 출력한다.
+# 잠금 안에서 다시 확인하고, 그래도 없거나 중복이면 복구한다.
+_ensure_config_locked() {
+  local cfg="$1" src="$2" n
+  config_imported "$cfg" && return 0
+  n="$(config_count "$cfg")"
+  if [ "$n" -gt 1 ]; then
+    echo "vpn-ctl: openvpn3 에 '$cfg' 가 ${n}개 중복돼 있어 하나로 정리합니다" >&2
+  else
+    echo "vpn-ctl: openvpn3 에 프로파일이 없어 보관본으로 복구합니다: $(basename "$src")" >&2
+  fi
+  _import_to_backend "$src" "$cfg"
+}
+
+# 활성 프로파일이 openvpn3 에 정확히 하나 등록돼 있도록 보장하고 그 이름을 출력한다.
 # 등록된 .ovpn 자체가 없으면 실패한다 (= missing-config).
 ensure_config() {
   local cfg; cfg="$(active_name)"
@@ -198,8 +257,7 @@ ensure_config() {
 
   local src; src="$(stored_path_of "$cfg")"
   [ -n "$src" ] || return 1
-  echo "vpn-ctl: openvpn3 에 프로파일이 없어 보관본으로 복구합니다: $(basename "$src")" >&2
-  import_to_backend "$src" "$cfg" || return 1
+  with_backend_lock _ensure_config_locked "$cfg" "$src" || return 1
   printf '%s\n' "$cfg"
 }
 
@@ -220,10 +278,17 @@ EOF
   printf '%s]\n' "$out"
 }
 
-config_imported() {
+config_count() {
   local cfg="$1"
-  [ -n "$cfg" ] || return 1
-  configs_list_names | grep -qxF "$cfg"
+  [ -n "$cfg" ] || { echo 0; return 0; }
+  configs_list_names | grep -cxF "$cfg"
+}
+
+# "쓸 수 있게 등록됨" = 그 이름이 **정확히 하나**. 두 개 이상이면 openvpn3 가
+# 이름으로 고르지 못해 session-start 가 "More than one configuration profile
+# was found" 로 실패한다 — 없는 것과 똑같이 복구 대상이다.
+config_imported() {
+  [ "$(config_count "$1")" -eq 1 ]
 }
 
 # 살아 있는 세션 전부를 "<config><TAB><status>" 로 나열한다.
@@ -417,7 +482,7 @@ cmd_forget() {
 
   # openvpn3 등록과 보관본을 함께 지운다. 한쪽만 남기면 status 의 판단 근거와
   # 실제 상태가 갈린다.
-  if have_backend && backend_ready; then remove_backend_config "$name"; fi
+  if have_backend && backend_ready; then with_backend_lock remove_backend_config "$name"; fi
   rm -f "$src"
 
   # 활성이던 걸 지웠으면 남은 것 중 최신으로 승계한다. 아무것도 안 남으면
