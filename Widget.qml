@@ -46,11 +46,35 @@ BarWidget {
   property string detail: ""
   property string actionable: ""
   property string lastError: ""
+
+  // 직전 시도의 실패 원인 (status 의 .last_error). 실패한 세션은 openvpn3 에서
+  // 흔적 없이 사라지므로, 코어가 남긴 이 기록이 없으면 "연결 안 됨" 만 보인다.
+  property string failReason: ""
+  property string failSummary: ""   // 한 줄 요약 — 제목으로 쓴다
+  property string failAdvice: ""    // 할 일 한 줄
+  property string failHint: ""      // 자세한 설명 — "자세히" 안에만
+  property string failAt: ""
+  property string failRaw: ""
+  readonly property bool hasFailure: vpnState === "disconnected" && failSummary.length > 0
+
+  // 실패 상세(설명·원문)는 접어 둔다. 사용자에게 필요한 건 "뭐가 문제고 뭘 하면
+  // 되나" 두 줄이고, 원문은 관리자에게 넘길 때나 필요하다.
+  property bool showFailDetail: false
+
+  // connecting 이 너무 오래 걸림 — 서버가 로그인 페이지를 안 준다
+  property bool stalled: false
+
+  // 바 아이콘을 경고색으로 칠할 상황
+  readonly property bool alert: hasFailure || (vpnState === "connecting" && stalled)
+
+  // 사용자가 연결 시도를 직접 취소했다 — 그 뒤 up 이 실패로 끝나도 오류가 아니다
+  property bool cancelled: false
   property string authUrl: ""
   property bool urlCopied: false
 
   readonly property bool busy: statusProc.running || actionProc.running
                                || pickProc.running || importProc.running
+                               || downProc.running
 
   // 아이콘은 두 종류만 쓴다 — 바에 위젯이 여러 개라 종류가 많으면 헷갈린다.
   //   󰦝 온전한 쉴드  : 쓸 준비가 된 상태 (연결됨 / 미연결 / 인증 중)
@@ -60,6 +84,7 @@ BarWidget {
   readonly property bool usable: vpnState === "connected"
                                  || vpnState === "disconnected"
                                  || vpnState === "authenticating"
+                                 || vpnState === "connecting"
                                  || vpnState === "backend-busy"
                                  || vpnState === "loading"
 
@@ -79,7 +104,8 @@ BarWidget {
       case "backend-busy":       return "확인 중…"
       case "missing-backend":    return "openvpn3 설치 필요"
       case "missing-config":     return ".ovpn 파일 등록 필요"
-      case "disconnected":    return "연결 안 됨"
+      case "disconnected":    return hasFailure ? failSummary : "연결 안 됨"
+      case "connecting":      return stalled ? "서버 응답 없음" : "연결 중…"
       case "authenticating":  return "브라우저에서 로그인 대기"
       case "connected":       return "연결됨"
       case "backend-failed":  return "vpn-ctl 실행 실패"
@@ -108,6 +134,14 @@ BarWidget {
         root.profiles = d.profiles || []
         root.detail = d.detail || ""
         root.actionable = d.actionable || ""
+        root.stalled = d.stalled === true
+        var f = d.last_error || null
+        root.failReason = f ? (f.reason || "") : ""
+        root.failSummary = f ? (f.summary || "연결 실패") : ""
+        root.failAdvice = f ? (f.advice || "") : ""
+        root.failHint = f ? (f.hint || "") : ""
+        root.failAt = f ? (f.at || "") : ""
+        root.failRaw = f ? (f.raw || "") : ""
       } catch (e) {
         root.vpnState = "backend-failed"
         root.detail = "status JSON 파싱 실패: " + statusOut.text.trim().slice(0, 120)
@@ -119,8 +153,13 @@ BarWidget {
 
   function refreshNow() { if (!statusProc.running) statusProc.running = true }
 
+  // 연결 시도 중에는 상태가 초 단위로 바뀐다 (URL 도착, 실패) — 자주 본다
+  readonly property bool inFlight: vpnState === "connecting"
+                                   || vpnState === "authenticating"
+                                   || actionProc.running
+
   Timer {
-    interval: root.refreshSec * 1000
+    interval: root.inFlight ? 3000 : root.refreshSec * 1000
     running: true
     repeat: true
     triggeredOnStart: true
@@ -132,7 +171,10 @@ BarWidget {
     id: actionProc
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(code) {
-      if (code !== 0) root.lastError = actionErr.text.trim()
+      // 연결 실패의 원인은 status 의 last_error 가 사람 말로 알려준다.
+      // up 의 stderr 원문(openvpn3 오류 등)은 그게 없을 때만 보여준다.
+      if (code !== 0 && !root.cancelled) root.lastError = actionErr.text.trim()
+      root.cancelled = false
       root.refreshNow()
     }
   }
@@ -144,8 +186,43 @@ BarWidget {
     actionProc.running = true
   }
 
-  function connectVpn()    { runAction(["up"]) }
-  function disconnectVpn() { runAction(["down"]) }
+  // 끊기는 따로 돈다. up 은 서버가 인증을 끝낼 때까지 (실패면 60초) 붙잡고
+  // 있으므로, actionProc 를 같이 쓰면 그동안 취소할 수가 없다.
+  Process {
+    id: downProc
+    command: [root.backendCommand, "down"]
+    stderr: StdioCollector { id: downErr; waitForEnd: true }
+    onExited: function(code) {
+      if (code !== 0) root.lastError = downErr.text.trim()
+      root.refreshNow()
+    }
+  }
+
+  function connectVpn() {
+    root.cancelled = false
+    root.failSummary = ""       // 새 시도 — 이전 실패 표시는 치운다
+    root.showFailDetail = false
+    runAction(["up"])
+  }
+
+  function disconnectVpn() {
+    if (downProc.running) return
+    root.lastError = ""
+    if (actionProc.running) root.cancelled = true
+    downProc.running = true
+  }
+
+  Process {
+    id: clearProc
+    command: [root.backendCommand, "clear-error"]
+    onExited: root.refreshNow()
+  }
+
+  function dismissFailure() {
+    root.failSummary = ""
+    root.showFailDetail = false
+    if (!clearProc.running) clearProc.running = true
+  }
 
   // ── .ovpn 파일 선택 → import ──────────────────────────────────────────
   // Omarchy 공식 파일 선택기. 종료코드 1 = 아무것도 안 고름(정상),
@@ -237,6 +314,22 @@ BarWidget {
 
   Timer { id: copiedReset; interval: 2500; onTriggered: root.urlCopied = false }
 
+  property bool rawCopied: false
+
+  Process {
+    id: rawCopyProc
+    onExited: function(code) { root.rawCopied = (code === 0); rawCopiedReset.restart() }
+  }
+
+  Timer { id: rawCopiedReset; interval: 2500; onTriggered: root.rawCopied = false }
+
+  function copyFailRaw() {
+    if (rawCopyProc.running) return
+    var text = (root.failAt.length > 0 ? root.failAt + "  " : "") + root.failRaw
+    rawCopyProc.command = ["sh", "-c", "printf '%s' \"$1\" | wl-copy", "sh", text]
+    rawCopyProc.running = true
+  }
+
   function copyAuthUrl() {
     if (urlProc.running || copyProc.running) return
     root.lastError = ""
@@ -274,7 +367,10 @@ BarWidget {
   // ── 팝업 라우팅 계약 ──────────────────────────────────────────────────
   property bool panelOpen: false
   readonly property bool opened: panelOpen
-  function open() { panelOpen = true; urlCopied = false; pendingForget = ""; refreshNow() }
+  function open() {
+    panelOpen = true; urlCopied = false; pendingForget = ""; showFailDetail = false
+    refreshNow()
+  }
   function close() { panelOpen = false }
   function togglePanel() { panelOpen ? close() : open() }
 
@@ -295,7 +391,13 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: root.glyph
-    dimmed: !root.connected
+    // 경고 상황이면 흐리게 하지 않고 경고색(bar.urgent)으로 칠한다
+    dimmed: !root.connected && !root.alert
+    active: root.alert
+    tooltipText: root.alert
+                 ? (root.vpnState === "connecting" ? "VPN 서버 응답 없음"
+                                                     : "VPN " + root.failSummary)
+                 : ""
 
     onPressed: function(b) {
       if (b === Qt.RightButton) root.refreshNow()
@@ -330,7 +432,7 @@ BarWidget {
 
         Text {
           text: root.headline
-          color: Color.foreground
+          color: root.alert && root.bar && root.bar.urgent ? root.bar.urgent : Color.foreground
           font.family: Style.font.family
           font.pixelSize: Style.font.body * 1.15
           font.bold: true
@@ -350,13 +452,98 @@ BarWidget {
 
         Text {
           visible: root.detail.length > 0 && root.vpnState !== "missing-backend"
-                   && root.vpnState !== "missing-config"
+                   && root.vpnState !== "missing-config" && !root.hasFailure
           text: root.detail
           width: parent.width
           wrapMode: Text.WordWrap
           color: Qt.darker(Color.foreground, 1.3)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
+        }
+
+        // ── 직전 연결 실패 ──────────────────────────────────────────────
+        // 제목(요약)은 위 headline 이 이미 보여준다. 여기선 할 일 한 줄과
+        // 버튼만. 설명·시각·openvpn3 원문은 "자세히" 를 눌러야 펼쳐진다.
+        Column {
+          visible: root.hasFailure
+          width: parent.width
+          spacing: Style.space(10)
+
+          Text {
+            visible: root.failAdvice.length > 0
+            text: root.failAdvice
+            width: parent.width
+            wrapMode: Text.WordWrap
+            color: Qt.darker(Color.foreground, 1.2)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            spacing: Style.space(8)
+
+            Button {
+              text: root.busy ? "연결 중…" : "다시 연결"
+              bordered: true
+              enabled: !root.busy && root.hasProfile
+              onClicked: root.connectVpn()
+            }
+
+            Button {
+              text: root.showFailDetail ? "접기" : "자세히"
+              onClicked: root.showFailDetail = !root.showFailDetail
+            }
+
+            Button {
+              text: "닫기"
+              tooltipText: "이 실패 표시를 지웁니다"
+              enabled: !clearProc.running
+              onClicked: root.dismissFailure()
+            }
+          }
+
+          Column {
+            visible: root.showFailDetail
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSeparator { width: parent.width }
+
+            Text {
+              text: root.failHint
+              width: parent.width
+              wrapMode: Text.WordWrap
+              color: Qt.darker(Color.foreground, 1.2)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              visible: root.failAt.length > 0
+              text: "발생 " + root.failAt
+              color: Qt.darker(Color.foreground, 1.5)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              visible: root.failRaw.length > 0
+              text: root.failRaw
+              width: parent.width
+              wrapMode: Text.WordWrap
+              color: Qt.darker(Color.foreground, 1.5)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Button {
+              visible: root.failRaw.length > 0
+              text: root.rawCopied ? "복사됨" : "원문 복사"
+              tooltipText: "관리자에게 전달할 때 붙여넣으세요"
+              enabled: !rawCopyProc.running
+              onClicked: root.copyFailRaw()
+            }
+          }
         }
 
         // ── 1단계: openvpn3 미설치 ──────────────────────────────────────
@@ -427,13 +614,15 @@ BarWidget {
           width: parent.width
           spacing: Style.space(8)
 
-          PanelSeparator { width: parent.width }
+          // 실패 표시가 있으면 연결 버튼이 그쪽("다시 연결")으로 옮겨 가므로
+          // 이 구분선은 바로 아래 프로파일 구분선과 겹친다
+          PanelSeparator { width: parent.width; visible: !root.hasFailure }
 
           // 등록된 .ovpn 이 없으면 누를 수 없다. disconnected 자체가 이미
           // "활성 프로파일이 있다" 는 뜻이지만, 상태와 목록이 어긋나는 순간이
           // 있더라도 연결을 시도하지 않도록 hasProfile 을 함께 본다.
           Button {
-            visible: root.vpnState === "disconnected"
+            visible: root.vpnState === "disconnected" && !root.hasFailure
             text: root.busy ? "연결 중…" : "연결"
             bordered: true
             enabled: !root.busy && root.hasProfile
@@ -443,9 +632,11 @@ BarWidget {
           Button {
             visible: root.vpnState === "connected"
                      || root.vpnState === "authenticating"
-            text: root.busy ? "처리 중…" : "끊기"
+                     || root.vpnState === "connecting"
+            text: downProc.running ? "처리 중…"
+                  : (root.vpnState === "connected" ? "끊기" : "취소")
             bordered: true
-            enabled: !root.busy
+            enabled: !downProc.running
             onClicked: root.disconnectVpn()
           }
 
@@ -542,7 +733,7 @@ BarWidget {
 
         // ── 오류 표시 ───────────────────────────────────────────────────
         Column {
-          visible: root.lastError.length > 0
+          visible: root.lastError.length > 0 && !root.hasFailure
           width: parent.width
           spacing: Style.space(4)
 

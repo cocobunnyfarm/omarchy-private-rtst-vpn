@@ -79,6 +79,7 @@ vpn-ctl import <file>      # .ovpn 보관 + 활성 지정 + openvpn3 등록
 vpn-ctl profiles [--json]  # 보관된 .ovpn 목록 (활성 표시)
 vpn-ctl use <name>         # 활성 프로파일 전환
 vpn-ctl forget <name>      # 보관본 + openvpn3 프로파일 삭제
+vpn-ctl clear-error        # 마지막 실패 기록 지우기 (위젯의 "확인")
 ```
 
 config 인자는 CLI 편의용이며, **위젯은 어떤 명령에도 이름을 넘기지 않는다.**
@@ -152,13 +153,75 @@ openvpn3 = hell                (세션이 붙는 이름)
 | `backend-busy` | openvpn3 서비스 응답 없음 (부팅 직후 등) | 쉴드. "확인 중…" — **연결 여부를 단정하지 않는다** |
 | `disconnected` | 준비됐고 미연결 | 쉴드 (흐림). 연결 + 프로파일 관리 |
 | — | 활성 프로파일엔 세션이 없지만 **다른 이름**으로 살아 있으면 그 세션의 상태를 보고하고 `config` 에 그 이름을 담는다. "끊김" 이라고 거짓말하지 않는다 | |
-| `authenticating` | SSO 인증 대기 | 쉴드 (흐림). 인증 URL 복사 버튼 |
+| `connecting` | 세션은 있고 서버와 협상 중 (SSO URL 아직 못 받음 / 재연결 중). `since` = 세션 시작 epoch, `stalled` = 20초 넘게 URL 이 안 옴 | 쉴드 (흐림) + 취소 버튼. `stalled` 면 **쉴드를 경고색으로** + 툴팁 |
+| `authenticating` | SSO 인증 대기 | 쉴드 (흐림). 인증 URL 복사 + 취소 버튼 |
 | `connected` | 연결됨 | 쉴드 (밝게) |
 | `error` | 그 외 (보관본이 있는데 등록에 실패 등) | 금간 쉴드 + `detail` |
 
 `missing-config` 는 백엔드 응답 여부와 **무관하게** 확정할 수 있으므로
 `backend-busy` 보다 먼저 판정한다. "아직 아무것도 고르지 않았다" 는
 openvpn3 사정과 상관없는 사실이고, 위젯은 이걸 알아야 연결을 잠글 수 있다.
+
+### 실패 원인 (`last_error`)
+
+실패한 세션은 openvpn3 에서 **흔적 없이 사라진다.** 지금 상태만 보면
+"인증 60초 대기 → 실패 → 세션 소멸" 이 그냥 `disconnected` 로 보이고, 사용자는
+버튼이 안 먹는 줄 안다. 2026-11-27 에 실제로 겪었다 — 서버의 인증 연동이 죽어
+모두가 연결에 실패했는데 위젯은 "연결 안 됨" 만 보여줬다.
+
+그래서 코어는 세션마다 `openvpn3 log` 를 백그라운드로 붙여 로그를 남긴다
+(`up` 이 세션 시작 전에 `--config` 로 띄우고, 이미 있는 세션은 `status` 가 뒤늦게
+`--session-path` 로 붙인다). 세션이 없을 때 그 로그가 실패로 끝났으면
+`disconnected` 에 `last_error` 를 붙인다:
+
+```json
+"last_error": {
+  "reason": "server-auth",
+  "at": "2026-11-27 15:20:19",
+  "summary": "VPN 서버 인증 장애",
+  "advice": "내 PC 문제 아님 · 관리자에게 알려 주세요",
+  "hint": "서버가 로그인 페이지를 주지 않고 인증을 실패 처리했습니다. …",
+  "raw": "[STATUS] Connection, Client authentication failed: Authentication failed"
+}
+```
+
+| `reason` | 판단 근거 | 누구 문제 |
+|---|---|---|
+| `server-auth` | SSO URL 이 한 번도 안 왔는데 인증 실패 | 서버 (인증 연동) |
+| `auth-failed` | URL 은 왔는데 인증 실패 | 로그인 거부 / 시간 초과 |
+| `session-expired` | `SESSION_EXPIRED` (재연결을 서버가 거부) | 대개 서버 재시작 |
+| `unreachable` | 타임아웃·DNS·TLS 협상 실패 | 네트워크 또는 서버 다운 |
+| `other` | 그 밖의 FATAL/failed | — |
+
+`down` 으로 일부러 끊은 건 실패가 아니므로 기록을 지운다. 새로 `up` 할 때도 지운다.
+
+```
+~/.local/state/rtst-vpn/     # $XDG_STATE_HOME/rtst-vpn
+├── session.log              # 마지막 세션의 openvpn3 로그
+├── auth-seen                # 그 세션에서 SSO URL 이 나온 적 있음
+└── watch.{lock,pid,target}  # 감시자 (잠금은 감시자가 살아 있는 동안 쥔다)
+```
+
+`summary`/`advice` 는 위젯이 그대로 보여줄 짧은 말이고, `hint`/`raw` 는 상세용이다.
+문구를 정하는 건 코어다 — UI 는 reason 별 문구표를 따로 들지 않는다.
+
+위젯은 **핵심만 보이고 상세는 접는다**:
+
+```
+VPN 서버 인증 장애                ← 제목 = summary (경고색)
+󰦝 hansulee-hell
+내 PC 문제 아님 · 관리자에게 알려 주세요   ← advice
+[다시 연결]  자세히  닫기
+```
+
+`자세히` 를 누르면 `hint`, 발생 시각, openvpn3 원문, `원문 복사` 버튼이 펼쳐진다
+(패널을 다시 열면 접힌다). 바의 쉴드는 경고색, 툴팁은 "VPN " + summary.
+`닫기` 는 `clear-error`. 처음엔 설명 문단과 원문을 다 펼쳐 보여줬는데, 정작
+"뭐가 문제고 뭘 하면 되나" 가 묻혀서 바꿨다.
+
+**`up` 은 서버가 인증을 끝낼 때까지 블록한다** (`openvpn3 session-start` 가
+URL 을 받거나 실패할 때까지 안 돌아온다 — 실패면 60초). 그래서 위젯의 끊기/취소는
+연결과 다른 Process 로 돌린다. 같이 쓰면 그 60초 동안 취소할 수 없다.
 
 `actionable` 은 사용자가 실행해야 하는 명령 문자열(또는 `null`).
 **위젯은 이걸 자동 실행하지 않는다** — 아래 참조.
